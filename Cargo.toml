@@ -1,0 +1,29 @@
+[package]
+name = "nosv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+description = "A safe Rust runtime and async executor for nOS-V"
+readme = "README.md"
+
+[dependencies]
+libc = "0.2"
+nosv-sys = { path = "../nosv-sys" }
+
+[features]
+default = ["rt", "time"]
+rt = []
+time = ["rt"]
+io-uring = ["rt"]
+futures-io = ["io-uring"]
+native-sync = []
+
+[dev-dependencies]
+static_assertions = "1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -1,0 +1,4 @@
+[env]
+# Point this at a directory containing nos-v.pc when nOS-V is not installed in
+# a default pkg-config search path.
+PKG_CONFIG_PATH = { value = "/path/to/nos-v/.nosv-prefix/lib/pkgconfig", force = true }
