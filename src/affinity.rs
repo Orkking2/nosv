@@ -1,38 +1,50 @@
 //! Validated task affinity values.
+//!
+//! nOS-V encodes affinity as C bitfields. This module replaces those layout-
+//! sensitive fields with ordinary Rust enums, validates the 29-bit native index,
+//! and converts back only while an unsubmitted task is being built.
 
 use crate::{
     error::NativeError,
     topology::{CpuId, NumaNodeId},
 };
 
+/// Largest index representable by the native affinity bitfield.
+///
+/// The public CPU and NUMA identifiers also participate in non-affinity APIs and
+/// may therefore be wider; conversion rejects them only when affinity encoding
+/// actually requires this narrower representation.
 const MAX_INDEX: u32 = (1 << 29) - 1;
 
 /// Whether placement is preferred or mandatory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AffinityKind {
-    /// Prefer the target.
+    /// Prefer the target but allow nOS-V to choose another placement.
     Preferred,
-    /// Require the target.
+    /// Require nOS-V to place the task at the selected target.
     Strict,
 }
 
 /// A validated nOS-V placement target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AffinityTarget {
-    /// A system CPU.
+    /// A system CPU identifier from the runtime's topology view.
     Cpu(CpuId),
-    /// A system NUMA node.
+    /// A system NUMA-node identifier from the runtime's topology view.
     NumaNode(NumaNodeId),
-    /// A native complex-set identifier.
+    /// A native user-defined complex-set identifier.
     ComplexSet(u32),
 }
 
-/// Placement fixed before a task's first submission.
+/// Placement fixed before a task's first native submission.
+///
+/// Affinity is deliberately immutable after [`crate::task::TaskBuilder::spawn`]
+/// because nOS-V documents concurrent or post-submit mutation as undefined.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Affinity {
-    /// Leave placement to nOS-V.
+    /// Leave placement entirely to nOS-V's scheduler.
     Any,
-    /// Place at `target` with the requested strength.
+    /// Apply `target` as either a preference or strict constraint.
     Target {
         /// Placement strength.
         kind: AffinityKind,
@@ -42,28 +54,43 @@ pub enum Affinity {
 }
 
 impl Affinity {
-    /// Prefers a CPU.
+    /// Constructs a soft preference for `cpu`.
+    ///
+    /// The CPU index is validated against the C bitfield when the task is
+    /// spawned, so this constant constructor remains infallible and ergonomic.
     pub const fn preferred_cpu(cpu: CpuId) -> Self {
         Self::Target {
             kind: AffinityKind::Preferred,
             target: AffinityTarget::Cpu(cpu),
         }
     }
-    /// Requires a CPU.
+
+    /// Constructs a strict placement requirement for `cpu`.
+    ///
+    /// Spawn fails with [`NativeError::InvalidParameter`] if the identifier does
+    /// not fit the native affinity representation.
     pub const fn strict_cpu(cpu: CpuId) -> Self {
         Self::Target {
             kind: AffinityKind::Strict,
             target: AffinityTarget::Cpu(cpu),
         }
     }
-    /// Prefers a NUMA node.
+
+    /// Constructs a soft preference for `node`.
+    ///
+    /// This selects a system NUMA identifier rather tha nOS-v's logical index,
+    /// matching the values returned by [`crate::Topology::numa_nodes`].
     pub const fn preferred_numa_node(node: NumaNodeId) -> Self {
         Self::Target {
             kind: AffinityKind::Preferred,
             target: AffinityTarget::NumaNode(node),
         }
     }
-    /// Requires a NUMA node.
+
+    /// Constructs a strict placement requirement for `node`.
+    ///
+    /// Validation is deferred to task construction because the same ID wrapper
+    /// can be used by wider topology queries that do not have a 29-bit limit.
     pub const fn strict_numa_node(node: NumaNodeId) -> Self {
         Self::Target {
             kind: AffinityKind::Strict,
@@ -71,6 +98,11 @@ impl Affinity {
         }
     }
 
+    /// Encodes this safe value into nOS-V's generated bitfield structure.
+    ///
+    /// This is kept crate-private so generated setters and ABI types never
+    /// become part of the safe public interface. The method explicitly fills
+    /// every field and rejects indices that would otherwise be truncated.
     pub(crate) fn to_raw(self) -> Result<nosv_sys::nosv_affinity_t, NativeError> {
         let mut raw = nosv_sys::nosv_affinity_t::default();
         match self {

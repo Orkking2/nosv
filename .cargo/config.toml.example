@@ -1,4 +1,5 @@
 [env]
-# Point this at a directory containing nos-v.pc when nOS-V is not installed in
-# a default pkg-config search path.
-PKG_CONFIG_PATH = { value = "/path/to/nos-v/.nosv-prefix/lib/pkgconfig", force = true }
+PKG_CONFIG_PATH = { value = "../nos-v/.nosv-prefix/lib/pkgconfig", relative = true, force = true }
+
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,../nos-v/.nosv-prefix/lib"]

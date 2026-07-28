@@ -2,7 +2,12 @@
 
 use std::{any::Any, error::Error, fmt};
 
-/// A native nOS-V error code.
+/// A stable Rust representation of a nOS-v status code.
+///
+/// Known negative values receive descriptive variants; unrecognized values are
+/// preserved by [`NativeError::Unknown`] so newer native libraries do not lose
+/// diagnostic information. The wrapper avoids relying on nOS-V's incomplete
+/// error-string table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum NativeError {
@@ -18,7 +23,7 @@ pub enum NativeError {
     NotInitialized,
     /// Native allocation failed.
     OutOfMemory,
-    /// An nOS-V task context is required.
+    /// a nOS-v task context is required.
     OutsideTask,
     /// A native resource is busy.
     Busy,
@@ -29,6 +34,11 @@ pub enum NativeError {
 }
 
 impl NativeError {
+    /// Converts a C return code into Rust's success-or-error convention.
+    ///
+    /// Zero becomes `Ok(())`; every other value is mapped to a known variant
+    /// or preserved verbatim. Centralizing this translation keeps raw integer
+    /// comparisons out of lifecycle and executor code.
     pub(crate) fn from_code(code: i32) -> Result<(), Self> {
         if code == nosv_sys::NOSV_SUCCESS {
             return Ok(());
@@ -47,7 +57,10 @@ impl NativeError {
         })
     }
 
-    /// Returns the underlying integer code.
+    /// Returns the exact integer status represented by this value.
+    ///
+    /// For [`NativeError::Unknown`] this round-trips the original code, which is
+    /// useful for logging and compatibility with native diagnostics.
     pub fn code(self) -> i32 {
         match self {
             Self::InvalidCallback => nosv_sys::NOSV_ERR_INVALID_CALLBACK,
@@ -65,6 +78,10 @@ impl NativeError {
 }
 
 impl fmt::Display for NativeError {
+    /// Formats the error without calling back into nOS-V.
+    ///
+    /// Keeping formatting purely in Rust makes errors safe to display after the
+    /// runtime has shut down or in a forked child.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::InvalidCallback => "invalid callback",
@@ -73,7 +90,7 @@ impl fmt::Display for NativeError {
             Self::InvalidParameter => "invalid parameter",
             Self::NotInitialized => "nOS-V is not initialized",
             Self::OutOfMemory => "native allocation failed",
-            Self::OutsideTask => "operation requires an nOS-V task",
+            Self::OutsideTask => "operation requires a nOS-v task",
             Self::Busy => "native resource is busy",
             Self::Timeout => "native operation timed out",
             Self::Unknown(_) => "unknown native error",
@@ -84,7 +101,10 @@ impl fmt::Display for NativeError {
 
 impl Error for NativeError {}
 
-/// Failure while constructing a runtime.
+/// Failure while constructing and publishing a runtime generation.
+///
+/// Initialization is rolled back before this error is returned, so no partially
+/// usable [`crate::Runtime`] escapes.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum InitError {
@@ -95,15 +115,23 @@ pub enum InitError {
 }
 
 impl fmt::Display for InitError {
+    /// Formats the error without calling back into nOS-V.
+    ///
+    /// Keeping formatting purely in Rust makes errors safe to display after the
+    /// runtime has shut down or in a forked child.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyInTask => f.write_str("cannot create a runtime inside an nOS-V task"),
+            Self::AlreadyInTask => f.write_str("cannot create a runtime inside a nOS-v task"),
             Self::Native(error) => write!(f, "runtime initialization failed: {error}"),
         }
     }
 }
 
 impl Error for InitError {
+    /// Returns the underlying native error when this variant wraps one.
+    ///
+    /// State-validation variants originate in the safe layer and therefore have
+    /// no lower-level source.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Native(error) => Some(error),
@@ -113,16 +141,25 @@ impl Error for InitError {
 }
 
 impl From<NativeError> for InitError {
+    /// Wraps a translated native failure for `?`-based propagation.
     fn from(value: NativeError) -> Self {
         Self::Native(value)
     }
 }
 
 /// The runtime is no longer accepting operations.
+///
+/// This zero-sized error intentionally reveals no raw lifecycle state. It is used
+/// by capability-style queries where "closed, fork-inherited, or unavailable" is
+/// the only safe distinction callers need.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeClosed;
 
 impl fmt::Display for RuntimeClosed {
+    /// Formats the error without calling back into nOS-V.
+    ///
+    /// Keeping formatting purely in Rust makes errors safe to display after the
+    /// runtime has shut down or in a forked child.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("the nOS-V runtime is closed")
     }
@@ -130,7 +167,10 @@ impl fmt::Display for RuntimeClosed {
 
 impl Error for RuntimeClosed {}
 
-/// Failure to create a spawned future.
+/// Failure to create and initially submit a spawned future.
+///
+/// On return, the future and any native descriptor allocated for it have been
+/// reclaimed; a failed spawn never leaves a detached Rust task behind.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SpawnError {
@@ -142,7 +182,17 @@ pub enum SpawnError {
     Native(NativeError),
 }
 
+impl From<RuntimeClosed> for SpawnError {
+    fn from(_: RuntimeClosed) -> Self {
+        Self::RuntimeClosed
+    }
+}
+
 impl fmt::Display for SpawnError {
+    /// Formats the error without calling back into nOS-V.
+    ///
+    /// Keeping formatting purely in Rust makes errors safe to display after the
+    /// runtime has shut down or in a forked child.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RuntimeClosed => RuntimeClosed::fmt(&RuntimeClosed, f),
@@ -153,6 +203,10 @@ impl fmt::Display for SpawnError {
 }
 
 impl Error for SpawnError {
+    /// Returns the underlying native error when this variant wraps one.
+    ///
+    /// State-validation variants originate in the safe layer and therefore have
+    /// no lower-level source.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Native(error) => Some(error),
@@ -162,12 +216,17 @@ impl Error for SpawnError {
 }
 
 impl From<NativeError> for SpawnError {
+    /// Wraps a translated native failure for `?`-based propagation.
     fn from(value: NativeError) -> Self {
         Self::Native(value)
     }
 }
 
-/// Failure before a root future could be driven.
+/// Failure while establishing or operating an attached-thread `block_on`.
+///
+/// User-future panics are resumed after the thread has been detached and are not
+/// represented by this type. These variants describe runtime setup and native
+/// lifecycle failures only.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum BlockOnError {
@@ -175,7 +234,7 @@ pub enum BlockOnError {
     WrongThread,
     /// `block_on` calls may not be nested.
     Nested,
-    /// The caller is already an nOS-V task.
+    /// The caller is already a nOS-v task.
     AlreadyInTask,
     /// The runtime was inherited across `fork`.
     ForkedProcess,
@@ -185,12 +244,22 @@ pub enum BlockOnError {
     Native(NativeError),
 }
 
+impl From<RuntimeClosed> for BlockOnError {
+    fn from(_: RuntimeClosed) -> Self {
+        Self::RuntimeClosed
+    }
+}
+
 impl fmt::Display for BlockOnError {
+    /// Formats the error without calling back into nOS-V.
+    ///
+    /// Keeping formatting purely in Rust makes errors safe to display after the
+    /// runtime has shut down or in a forked child.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongThread => f.write_str("block_on must run on the runtime owner thread"),
             Self::Nested => f.write_str("nested block_on is not supported"),
-            Self::AlreadyInTask => f.write_str("block_on cannot run inside an nOS-V task"),
+            Self::AlreadyInTask => f.write_str("block_on cannot run inside a nOS-v task"),
             Self::ForkedProcess => f.write_str("runtime was inherited across fork"),
             Self::RuntimeClosed => RuntimeClosed::fmt(&RuntimeClosed, f),
             Self::Native(error) => write!(f, "block_on native operation failed: {error}"),
@@ -200,7 +269,10 @@ impl fmt::Display for BlockOnError {
 
 impl Error for BlockOnError {}
 
-/// Failure while shutting a runtime down.
+/// Failure while draining and shutting a runtime down.
+///
+/// Shutdown is deliberately strict: nOS-V may only be finalized on the owner
+/// thread and never through an inherited post-fork descriptor graph.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ShutdownError {
@@ -213,6 +285,10 @@ pub enum ShutdownError {
 }
 
 impl fmt::Display for ShutdownError {
+    /// Formats the error without calling back into nOS-V.
+    ///
+    /// Keeping formatting purely in Rust makes errors safe to display after the
+    /// runtime has shut down or in a forked child.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongThread => f.write_str("runtime shutdown must run on its owner thread"),
@@ -224,7 +300,10 @@ impl fmt::Display for ShutdownError {
 
 impl Error for ShutdownError {}
 
-/// The terminal result of a spawned task.
+/// The unsuccessful terminal result of a spawned task.
+///
+/// A [`crate::JoinHandle`] publishes this error only after the Rust future has
+/// been dropped and the corresponding native descriptor has been destroyed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum JoinError {
@@ -237,15 +316,25 @@ pub enum JoinError {
 }
 
 impl JoinError {
-    /// Returns true for cooperative cancellation.
+    /// Reports whether cooperative cancellation won the terminal race.
+    ///
+    /// Cancellation is not preemptive: this can become true only after the
+    /// future returns control from `poll` and the executor observes the request.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
-    /// Returns true when the task captured a panic.
+    /// Reports whether polling or destroying the task produced a panic.
+    ///
+    /// This is always false under an aborting panic profile because such a panic
+    /// terminates the process before a `JoinError` can be created.
     pub fn is_panic(&self) -> bool {
         matches!(self, Self::Panic(_))
     }
-    /// Returns the captured payload, consuming this error.
+    /// Extracts the captured panic payload, consuming this error.
+    ///
+    /// Cancellation and native-runtime failures return `None`. The payload can be
+    /// passed to [`std::panic::resume_unwind`] when join semantics should mirror
+    /// an ordinary thread join.
     pub fn into_panic(self) -> Option<Box<dyn Any + Send + 'static>> {
         match self {
             Self::Panic(payload) => Some(payload),
@@ -255,6 +344,10 @@ impl JoinError {
 }
 
 impl fmt::Display for JoinError {
+    /// Formats the error without calling back into nOS-V.
+    ///
+    /// Keeping formatting purely in Rust makes errors safe to display after the
+    /// runtime has shut down or in a forked child.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => f.write_str("task was cancelled"),

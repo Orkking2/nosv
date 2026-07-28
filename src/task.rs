@@ -15,62 +15,115 @@ use std::{
     pin::Pin,
     ptr,
     rc::Rc,
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     task::{Context, Poll, Wake, Waker},
 };
 
-/// Stable identifier used only for Rust-side diagnostics and registry lookup.
+/// Stable identifier used for Rust-side diagnostics and registry lookup.
+///
+/// This identifier is deliberately independent of the native descriptor address. Native
+/// descriptor storage can be reused after completion, while a [`TaskId`] remains unambiguous for
+/// as long as the corresponding entry is present in the runtime registry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct TaskId(pub(crate) u64);
+pub(crate) struct TaskId(
+    /// Monotonically allocated identifier within one runtime generation.
+    pub(crate) u64,
+);
 
+/// Spawn-time settings collected by [`TaskBuilder`].
+///
+/// These values are applied before the first native submission. Keeping configuration separate
+/// makes post-submission native attribute mutation impossible through the safe API.
 #[derive(Default)]
 pub(crate) struct TaskConfig {
+    /// Optional Rust-only name used in diagnostics.
     pub(crate) name: Option<Box<str>>,
+    /// Native scheduler priority to install before submission.
     pub(crate) priority: Option<i32>,
+    /// Validated native affinity to install before submission.
     pub(crate) affinity: Option<Affinity>,
+    /// Per-task value returned by the shared monitoring-cost callback.
     pub(crate) monitoring_cost: Option<u64>,
 }
 
+/// Reason a Rust future stopped being runnable.
+///
+/// The reason is recorded before user-owned values are dropped. A waker fired by a destructor
+/// therefore observes a terminal task and cannot resubmit its descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalKind {
+    /// The future returned [`Poll::Ready`].
     Ready,
+    /// A cooperative abort request won the race with completion.
     Cancelled,
+    /// Polling or destroying the future panicked.
     Panicked,
+    /// a nOS-v operation required to continue execution failed.
     RuntimeError,
 }
 
+/// Lifecycle of the native descriptor protected by [`NativeGate`].
+///
+/// Every submit and destroy operation is serialized by the gate mutex. This is the central
+/// lifetime guarantee preventing a late waker from submitting a descriptor during destruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativePhase {
+    /// Rust ownership exists, but the native descriptor is not ready for submission.
     Building,
+    /// The descriptor may be scheduled or currently executing its callback.
     Live,
+    /// Rust polling ended and the completed callback may retire the descriptor.
     Terminal(TerminalKind),
+    /// Descriptor destruction is in progress while the gate remains locked.
     Destroying,
+    /// The descriptor has been destroyed and can never be submitted again.
     Destroyed,
 }
 
+/// State that must be examined atomically when scheduling or retiring a task.
 struct NativeGate {
+    /// Live native descriptor, removed immediately before destruction.
     task: Option<RawTask>,
+    /// Current native ownership and execution phase.
     phase: NativePhase,
+    /// Whether this poll epoch already has a native submission in flight.
     wake_submitted: bool,
+    /// Whether the run callback is presently polling user code.
     polling: bool,
+    /// Whether cooperative cancellation has been requested.
     cancel_requested: bool,
 }
 
+/// Type-erased scheduling state shared by callbacks, wakers, and abort handles.
+///
+/// `TaskCore` intentionally contains no future or output. Stale wakers may retain it after
+/// completion, but the terminal gate state leaves them no usable native descriptor.
 pub(crate) struct TaskCore {
+    /// Authoritative gate for submission, polling transitions, and destruction.
     native: Mutex<NativeGate>,
+    /// Runtime that owns the registry and native task type.
     runtime: Weak<RuntimeCore>,
+    /// Rust-side registry identifier.
     id: TaskId,
+    /// Optional Rust-only diagnostic name.
     name: Option<Box<str>>,
+    /// Value exposed through the native monitoring callback.
     monitoring_cost: u64,
 }
 
 impl TaskCore {
+    /// Locks the native gate, recovering its state after mutex poisoning.
+    ///
+    /// User panics are caught at poll boundaries, so poisoning is not expected normally. Recovery
+    /// still lets cleanup reach a deterministic invariant check rather than unwinding through C.
     fn lock(&self) -> MutexGuard<'_, NativeGate> {
-        self.native
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.native.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Coalesces a Rust wake into one ordinary nOS-V submission for this poll epoch.
+    ///
+    /// The gate remains locked across submission, linearizing native use of the raw descriptor
+    /// against destruction. nOS-V's submit/suspend counter closes the wake-before-suspend race.
     fn schedule(&self) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
@@ -95,6 +148,10 @@ impl TaskCore {
         }
     }
 
+    /// Requests cooperative cancellation and schedules an idle task to observe it.
+    ///
+    /// Returns `true` only when this call changes a live task from not cancelled to cancelled. A
+    /// future already inside `poll` must return before the request can be acted upon.
     pub(crate) fn request_abort(&self) -> bool {
         let Some(runtime) = self.runtime.upgrade() else {
             return false;
@@ -123,6 +180,10 @@ impl TaskCore {
         true
     }
 
+    /// Opens a poll epoch and consumes the submission that entered the callback.
+    ///
+    /// `false` means cancellation was already pending. This method terminalizes the task in that
+    /// case, and the caller must destroy the future without polling it.
     fn start_poll(&self) -> bool {
         let mut gate = self.lock();
         if gate.phase != NativePhase::Live || gate.polling {
@@ -139,6 +200,10 @@ impl TaskCore {
         }
     }
 
+    /// Closes a poll epoch that returned [`Poll::Pending`].
+    ///
+    /// Returns `true` when the callback should suspend. If abort raced the poll, it instead records
+    /// terminal cancellation and returns `false`.
     fn finish_pending(&self) -> bool {
         let mut gate = self.lock();
         if gate.phase != NativePhase::Live || !gate.polling {
@@ -153,6 +218,10 @@ impl TaskCore {
         }
     }
 
+    /// Closes a poll epoch with a terminal outcome.
+    ///
+    /// A cancellation request installed while user code was polling takes precedence over `kind`.
+    /// The return value is `true` when the supplied outcome won that race.
     fn finish_terminal(&self, kind: TerminalKind) -> bool {
         let mut gate = self.lock();
         if gate.phase != NativePhase::Live || !gate.polling {
@@ -168,6 +237,10 @@ impl TaskCore {
         !cancelled
     }
 
+    /// Replaces a terminal reason without reviving the task.
+    ///
+    /// Cleanup uses this when a destructor panic is a more accurate outcome than the result first
+    /// recorded after polling.
     fn replace_terminal(&self, kind: TerminalKind) {
         let mut gate = self.lock();
         if matches!(gate.phase, NativePhase::Terminal(_)) {
@@ -175,6 +248,9 @@ impl TaskCore {
         }
     }
 
+    /// Converts a still-live pending task into a terminal native-runtime failure.
+    ///
+    /// An already-terminal phase is retained so cleanup cannot overwrite an earlier decision.
     fn suspend_failed(&self) {
         let mut gate = self.lock();
         if gate.phase == NativePhase::Live {
@@ -182,6 +258,10 @@ impl TaskCore {
         }
     }
 
+    /// Destroys a terminal descriptor and permanently closes its scheduling gate.
+    ///
+    /// Holding the gate through [`ffi::destroy`] means every wake either submits before
+    /// destruction starts or observes a non-live phase and becomes a no-op.
     fn retire(&self) -> Result<(), NativeError> {
         let mut gate = self.lock();
         if !matches!(gate.phase, NativePhase::Terminal(_)) {
@@ -196,37 +276,59 @@ impl TaskCore {
 }
 
 impl Wake for TaskCore {
+    /// Schedules the task after consuming one strong waker reference.
     fn wake(self: Arc<Self>) {
         self.schedule();
     }
+    /// Schedules the task while retaining the caller's strong waker reference.
     fn wake_by_ref(self: &Arc<Self>) {
         self.schedule();
     }
 }
 
+/// Type-erased operations needed by C callbacks after the future type is forgotten.
 trait ErasedRunnable: Send + Sync {
+    /// Polls the future at most once and performs its corresponding state transition.
     fn run_once(&self);
+    /// Makes a stored result visible after native descriptor retirement.
     fn publish_native_completion(&self);
+    /// Records a panic caught by the callback's outer containment boundary.
     fn force_panic(&self, payload: Box<dyn Any + Send + 'static>);
+    /// Records a nOS-v failure caught during callback cleanup.
     fn force_native_error(&self, error: NativeError);
 }
 
+/// Allocation whose ownership is transferred to one native descriptor.
+///
+/// Its pointer is stored in descriptor metadata using unaligned access. The completed callback is
+/// the sole successful-path consumer and reconstructs the box after the final run callback ends.
 struct NativeOwner {
+    /// Type-erased future operations used by native callbacks.
     runnable: Arc<dyn ErasedRunnable>,
+    /// Scheduling gate used to retire the descriptor before result publication.
     core: Arc<TaskCore>,
 }
 
+/// Shared result cell observed by a single [`JoinHandle`].
 struct JoinState<T> {
+    /// Result, publication flag, and waiter protected as one synchronization domain.
     inner: Mutex<JoinInner<T>>,
 }
+
+/// Mutable contents of [`JoinState`].
 struct JoinInner<T> {
+    /// Outcome produced by polling but withheld until native completion.
     result: Option<Result<T, JoinError>>,
+    /// Whether descriptor retirement is finished and `result` is published.
     native_completed: bool,
+    /// Most recent waker supplied by the join task.
     waiter: Option<Waker>,
+    /// Whether the sole join result has already been returned.
     consumed: bool,
 }
 
 impl<T> JoinState<T> {
+    /// Creates an unpublished join cell with no terminal result.
     fn new() -> Self {
         Self {
             inner: Mutex::new(JoinInner {
@@ -237,9 +339,14 @@ impl<T> JoinState<T> {
             }),
         }
     }
+    /// Locks the join cell, recovering its state after mutex poisoning.
     fn lock(&self) -> MutexGuard<'_, JoinInner<T>> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Stores the unique terminal result without publishing it yet.
+    ///
+    /// Publication is separate so successful joining guarantees that both the future and its C
+    /// descriptor have already been retired.
     fn store(&self, result: Result<T, JoinError>) {
         let mut inner = self.lock();
         if inner.result.is_some() {
@@ -247,12 +354,20 @@ impl<T> JoinState<T> {
         }
         inner.result = Some(result);
     }
+    /// Replaces an outcome with a callback-containment error while still unpublished.
+    ///
+    /// Once native completion is visible, changing the result would race a joiner entitled to
+    /// consume it, so late errors are ignored.
     fn replace_error_if_unpublished(&self, error: JoinError) {
         let mut inner = self.lock();
         if !inner.native_completed {
             inner.result = Some(Err(error));
         }
     }
+    /// Marks native cleanup complete and wakes the joiner outside the mutex.
+    ///
+    /// Calling the waker after unlocking avoids re-entrant polling deadlocks. Its invocation is
+    /// panic-contained because this method runs beneath an `extern "C"` callback.
     fn publish(&self) {
         let waiter = {
             let mut inner = self.lock();
@@ -268,9 +383,13 @@ impl<T> JoinState<T> {
     }
 }
 
+/// Concrete pinned future together with its scheduling and join state.
 struct Runnable<F, T> {
+    /// Type-independent scheduling state used to construct the poll waker.
     core: Arc<TaskCore>,
+    /// Pinned future, removed exactly once before completion publication.
     future: Mutex<Option<Pin<Box<F>>>>,
+    /// Destination for the terminal output or error.
     join: Arc<JoinState<T>>,
 }
 
@@ -279,19 +398,29 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    /// Locks the future slot, recovering it after mutex poisoning.
+    ///
+    /// Non-parallel native tasks prevent concurrent polling. The mutex additionally makes
+    /// ownership explicit to Rust and supports callback cleanup paths.
     fn lock_future(&self) -> MutexGuard<'_, Option<Pin<Box<F>>>> {
-        self.future.lock().unwrap_or_else(|p| p.into_inner())
+        self.future.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Removes and destroys the future while containing a destructor panic.
+    ///
+    /// Callers terminalize the gate first, so a future that wakes itself during destruction cannot
+    /// resubmit its native descriptor.
     fn take_and_drop_future(&self) -> Option<Box<dyn Any + Send + 'static>> {
         let future = self.lock_future().take();
         panic::catch_unwind(AssertUnwindSafe(|| drop(future))).err()
     }
 
+    /// Destroys an output that lost a completion/cancellation race without unwinding into C.
     fn drop_output(output: T) {
         let _ = panic::catch_unwind(AssertUnwindSafe(|| drop(output)));
     }
 
+    /// Drops the unpolled or pending future and stores cooperative cancellation.
     fn terminal_cancelled(&self) {
         let _ = self.take_and_drop_future();
         self.join.store(Err(JoinError::Cancelled));
@@ -303,6 +432,11 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    /// Performs one future poll from the native run callback.
+    ///
+    /// Every terminal branch closes the gate before dropping user-owned data. On `Pending`,
+    /// `nosv_suspend` is the final meaningful operation so nOS-V's early-wake handshake remains
+    /// valid when a wake raced the end of the poll.
     fn run_once(&self) {
         if !self.core.start_poll() {
             self.terminal_cancelled();
@@ -366,14 +500,17 @@ where
         }
     }
 
+    /// Publishes the stored outcome after descriptor retirement.
     fn publish_native_completion(&self) {
         self.join.publish();
     }
+    /// Converts an outer callback panic into an unpublished panic result.
     fn force_panic(&self, payload: Box<dyn Any + Send + 'static>) {
         self.core.replace_terminal(TerminalKind::Panicked);
         self.join
             .replace_error_if_unpublished(JoinError::Panic(payload));
     }
+    /// Converts callback cleanup failure into an unpublished runtime result.
     fn force_native_error(&self, error: NativeError) {
         self.join
             .replace_error_if_unpublished(JoinError::Runtime(error));
@@ -381,30 +518,52 @@ where
 }
 
 /// Future resolving only after both Rust state and the native descriptor retire.
+///
+/// Dropping a join handle detaches the task; it does not cancel it. Use [`JoinHandle::abort`] when
+/// cancellation is desired. Awaiting returns an output, cooperative cancellation, a captured panic
+/// under unwind-enabled builds, or a native runtime error.
 pub struct JoinHandle<T> {
+    /// Shared result and waiter state.
     join: Arc<JoinState<T>>,
+    /// Scheduling state retained for cancellation.
     core: Arc<TaskCore>,
 }
 
 impl<T> JoinHandle<T> {
-    /// Requests cooperative cancellation.
+    /// Requests cooperative, non-preemptive cancellation.
+    ///
+    /// Returns `true` if this call installed the request. It returns `false` if another abort won,
+    /// the task is terminal, the runtime is gone, or this handle was inherited across `fork`. A
+    /// future already inside `poll` must return before cancellation takes effect.
     pub fn abort(&self) -> bool {
         self.core.request_abort()
     }
     /// Returns a separately clonable cancellation handle.
+    ///
+    /// The returned value retains no join output; it only retains the scheduling state required to
+    /// request cancellation and observe descriptor retirement.
     pub fn abort_handle(&self) -> AbortHandle {
         AbortHandle {
             core: self.core.clone(),
         }
     }
-    /// Returns whether native completion has been published.
+    /// Reports whether native completion has been published to the join cell.
+    ///
+    /// A `true` value means polling this handle can complete immediately. This method does not
+    /// consume the stored result.
     pub fn is_finished(&self) -> bool {
         self.join.lock().native_completed
     }
 }
 
 impl<T> Future for JoinHandle<T> {
+    /// The spawned future's output or terminal executor error.
     type Output = Result<T, JoinError>;
+
+    /// Returns a published result or registers the most recent join waker.
+    ///
+    /// Only one consumer exists because `JoinHandle` is not clonable. Equivalent wakers are not
+    /// replaced, avoiding unnecessary reference-count traffic.
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.join.lock();
         assert!(!inner.consumed, "JoinHandle polled after completion");
@@ -430,27 +589,42 @@ impl<T> Future for JoinHandle<T> {
 }
 
 /// A clonable cooperative-cancellation capability.
+///
+/// Unlike [`JoinHandle`], this carries no output and may be shared freely. It lets code distribute
+/// cancellation authority without also granting permission to consume the task result.
 #[derive(Clone)]
 pub struct AbortHandle {
+    /// Scheduling state used to linearize cancellation with completion.
     core: Arc<TaskCore>,
 }
 impl AbortHandle {
     /// Requests cancellation, returning whether this call won the request race.
+    ///
+    /// Cancellation is cooperative: an actively polling future is not interrupted, and shutdown
+    /// can wait indefinitely for a future that never returns from `poll`.
     pub fn abort(&self) -> bool {
         self.core.request_abort()
     }
-    /// Returns whether native completion has been published.
+    /// Reports whether the native descriptor has been destroyed.
+    ///
+    /// This is an advisory snapshot; another thread may complete the task immediately afterward.
     pub fn is_finished(&self) -> bool {
         self.core.lock().phase == NativePhase::Destroyed
     }
 }
 
 /// Configuration fixed before a spawned task's first submission.
+///
+/// The builder is consumed by [`TaskBuilder::spawn`], making post-submission mutation impossible
+/// through the safe API. It borrows a [`Handle`] only while settings are assembled.
 pub struct TaskBuilder<'a> {
+    /// Runtime on which the configured task will be created.
     handle: &'a Handle,
+    /// Settings accumulated before descriptor creation.
     config: TaskConfig,
 }
 impl<'a> TaskBuilder<'a> {
+    /// Starts a builder with native defaults and a monitoring cost of one.
     pub(crate) fn new(handle: &'a Handle) -> Self {
         Self {
             handle,
@@ -458,26 +632,46 @@ impl<'a> TaskBuilder<'a> {
         }
     }
     /// Adds a Rust-only diagnostic name.
+    ///
+    /// The name does not become a distinct native task type. Current nOS-V task-type destruction
+    /// is a no-op, so per-task native labels would accumulate for the process lifetime.
     pub fn rust_name(mut self, name: impl Into<Box<str>>) -> Self {
         self.config.name = Some(name.into());
         self
     }
-    /// Sets native priority before submission.
+    /// Sets native scheduler priority before first submission.
+    ///
+    /// The integer is forwarded unchanged; its interpretation follows the active nOS-V scheduling
+    /// policy and configuration.
     pub fn priority(mut self, priority: i32) -> Self {
         self.config.priority = Some(priority);
         self
     }
-    /// Sets native affinity before submission.
+    /// Sets validated native affinity before first submission.
+    ///
+    /// Conversion to the packed C bitfield happens before descriptor creation, so validation
+    /// failure cannot strand partially initialized native ownership.
     pub fn affinity(mut self, affinity: Affinity) -> Self {
         self.config.affinity = Some(affinity);
         self
     }
-    /// Sets the value returned by the type's monitoring cost callback.
+    /// Sets the value returned by the shared monitoring-cost callback.
+    ///
+    /// This is monitoring metadata, not scheduler weight. A shared native task type can expose a
+    /// per-task value by reading the Rust owner stored in descriptor metadata.
     pub fn monitoring_cost(mut self, cost: u64) -> Self {
         self.config.monitoring_cost = Some(cost);
         self
     }
     /// Creates and submits the configured future.
+    ///
+    /// Spawn is linearized with shutdown: it either registers a submitted descriptor that shutdown
+    /// will drain, or fails without publishing a live native task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after shutdown, in a forked child, for invalid affinity, or when native
+    /// descriptor creation, metadata access, or initial submission fails.
     pub fn spawn<F, T>(self, future: F) -> Result<JoinHandle<T>, SpawnError>
     where
         F: Future<Output = T> + Send + 'static,
@@ -487,17 +681,29 @@ impl<'a> TaskBuilder<'a> {
     }
 }
 
-/// Spawns on the runtime currently polling this task.
+/// Spawns a future on the runtime currently polling this task.
+///
+/// A current handle exists only while a root or spawned future is being polled. Code with an
+/// explicit [`Handle`] should prefer [`Handle::spawn`].
+///
+/// # Errors
+///
+/// Returns [`SpawnError::RuntimeClosed`] outside a runtime poll context, or forwards the normal
+/// validation and native errors from [`Handle::spawn`].
 pub fn spawn<F, T>(future: F) -> Result<JoinHandle<T>, SpawnError>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
     Handle::try_current()
-        .map_err(|_| SpawnError::RuntimeClosed)?
+        .map_err(SpawnError::from)?
         .spawn(future)
 }
 
+/// Constructs, registers, and initially submits a native task for one future.
+///
+/// The runtime-state lock remains held from the lifecycle check through submission. It acts as a
+/// spawn permit: shutdown cannot drain until the task is either registered or fully reclaimed.
 pub(crate) fn spawn_on<F, T>(
     handle: &Handle,
     config: TaskConfig,
@@ -586,6 +792,13 @@ where
     Ok(JoinHandle { join, core })
 }
 
+/// Reads the unaligned owner pointer stored in native task metadata.
+///
+/// # Safety
+///
+/// `raw` must have been created by [`spawn_on`], its metadata must be initialized, and its completed
+/// callback must not have consumed the [`NativeOwner`]. Only that callback—or the proven
+/// unsubmitted failure path—may reconstruct the returned pointer as a `Box`.
 unsafe fn owner_pointer(raw: RawTask) -> *mut NativeOwner {
     let metadata = ffi::metadata(raw).unwrap_or_else(|_| invariant_abort("task metadata missing"));
     // SAFETY: spawn_on wrote this pointer with write_unaligned and ownership has
@@ -593,6 +806,15 @@ unsafe fn owner_pointer(raw: RawTask) -> *mut NativeOwner {
     unsafe { ptr::read_unaligned(metadata.as_ptr().cast::<*mut NativeOwner>()) }
 }
 
+/// nOS-V run callback that polls the Rust future exactly once.
+///
+/// The whole callback and the erased poll are panic-contained. An unexpected panic that cannot be
+/// represented as a join error aborts instead of unwinding into C.
+///
+/// # Safety
+///
+/// nOS-V must supply the live, non-parallel descriptor whose metadata contains an initialized
+/// [`NativeOwner`] created by [`spawn_on`].
 pub(crate) unsafe extern "C" fn run_callback(pointer: nosv_sys::nosv_task_t) {
     let callback = panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: nOS-V invokes callbacks with the live task descriptor.
@@ -611,6 +833,16 @@ pub(crate) unsafe extern "C" fn run_callback(pointer: nosv_sys::nosv_task_t) {
     }
 }
 
+/// Retires a completed native descriptor and publishes its Rust join result.
+///
+/// This is the unique successful-path consumer of [`NativeOwner`]. It destroys the C descriptor
+/// under the scheduling gate before waking the joiner, then removes the registry entry. Uncertain
+/// native ownership is leaked before aborting rather than risking use-after-free.
+///
+/// # Safety
+///
+/// nOS-V must invoke this exactly once for a terminal descriptor created by [`spawn_on`], after its
+/// final run callback returns and while descriptor metadata remains accessible.
 pub(crate) unsafe extern "C" fn completed_callback(pointer: nosv_sys::nosv_task_t) {
     let completed = panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: nOS-V invokes this exactly once with a live terminal descriptor.
@@ -638,6 +870,15 @@ pub(crate) unsafe extern "C" fn completed_callback(pointer: nosv_sys::nosv_task_
     }
 }
 
+/// Returns a task's Rust-side monitoring cost to nOS-V.
+///
+/// Panic containment falls back to one. The value is observational metadata and does not
+/// participate in ownership or scheduling state transitions.
+///
+/// # Safety
+///
+/// nOS-V must supply a live descriptor initialized by [`spawn_on`], and its [`NativeOwner`] must
+/// remain allocated for this call.
 pub(crate) unsafe extern "C" fn cost_callback(pointer: nosv_sys::nosv_task_t) -> u64 {
     panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: cost callback receives a live descriptor with initialized metadata.
@@ -649,28 +890,48 @@ pub(crate) unsafe extern "C" fn cost_callback(pointer: nosv_sys::nosv_task_t) ->
     .unwrap_or(1)
 }
 
+/// Reports an executor invariant violation and terminates the process.
+///
+/// Continuing after an impossible ownership transition could submit or free a stale raw pointer.
+/// Aborting preserves memory safety when native descriptor ownership can no longer be proven.
 fn invariant_abort(message: &str) -> ! {
     eprintln!("nOS-V Rust runtime invariant failed: {message}");
     std::process::abort()
 }
 
 /// Scoped access to queries valid only in a current nOS-V task.
+///
+/// The higher-ranked callback in [`with_current`] prevents this value from escaping. Its `Rc`
+/// marker also makes the capability neither `Send` nor `Sync`, so it cannot move to another worker.
 pub struct CurrentTask<'a> {
+    /// Invariant lifetime tying the capability to one closure invocation.
     _scope: PhantomData<&'a mut ()>,
+    /// Marker preventing transfer or sharing across threads.
     _not_send: PhantomData<Rc<()>>,
 }
 impl CurrentTask<'_> {
     /// Returns the system CPU currently executing this task.
+    ///
+    /// This is a snapshot. A suspended task can resume on a different nOS-V worker pthread.
     pub fn current_cpu(&self) -> Result<CpuId, NativeError> {
         CpuId::from_native(ffi::current_cpu()?)
     }
     /// Returns the system NUMA node currently executing this task.
+    ///
+    /// The result describes the present worker and is not a lasting affinity guarantee.
     pub fn current_numa_node(&self) -> Result<NumaNodeId, NativeError> {
         NumaNodeId::from_native(ffi::current_numa_node()?)
     }
 }
 
-/// Runs a query closure only when an nOS-V task context exists.
+/// Runs a query closure only while a nOS-v task context exists.
+///
+/// The limited capability exposes transient topology queries without exposing raw task handles or
+/// stackful native blocking operations to ordinary async code.
+///
+/// # Errors
+///
+/// Returns [`NativeError::OutsideTask`] when no current native task exists.
 pub fn with_current<R>(
     query: impl for<'a> FnOnce(&CurrentTask<'a>) -> Result<R, NativeError>,
 ) -> Result<R, NativeError> {
@@ -683,13 +944,20 @@ pub fn with_current<R>(
     })
 }
 
-/// A future that yields one scheduling turn.
+/// A future that cooperatively yields one scheduling turn.
+///
+/// Its first poll self-wakes and returns [`Poll::Pending`], causing native suspension and
+/// resubmission. The second poll completes. This is a scheduling hint, not a fairness guarantee.
 #[derive(Debug, Default)]
 pub struct YieldNow {
+    /// Whether the required pending result has already been produced.
     yielded: bool,
 }
 impl Future for YieldNow {
+    /// Yielding completes without producing a value.
     type Output = ();
+
+    /// Self-wakes and yields on the first poll, then completes on the second.
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
         if self.yielded {
             Poll::Ready(())
@@ -701,7 +969,10 @@ impl Future for YieldNow {
     }
 }
 
-/// Cooperatively yields this future once.
+/// Creates a future that cooperatively yields the current async task once.
+///
+/// The future must be awaited to have any effect. It can add pending points to CPU-heavy async
+/// loops, but it does not make blocking or unbounded work preemptible.
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }

@@ -4,6 +4,10 @@ use crate::error::NativeError;
 use std::mem::MaybeUninit;
 
 /// A checked snapshot of nOS-V shared-memory usage.
+///
+/// All three values are collected from the initialized native runtime and validated together before
+/// construction. The snapshot may become stale immediately as other tasks allocate or release
+/// shared memory.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MemoryStats {
     /// Bytes currently in use.
@@ -15,6 +19,11 @@ pub struct MemoryStats {
 }
 
 impl MemoryStats {
+    /// Queries and validates one native shared-memory snapshot.
+    ///
+    /// Separate nOS-V calls initialize `MaybeUninit` outputs for used bytes, capacity, and pressure.
+    /// Values are read only after each call succeeds, then checked for `used <= size`, finite
+    /// pressure, and the documented `0.0..=1.0` range.
     pub(crate) fn query() -> Result<Self, NativeError> {
         let (mut used, mut size, mut pressure) = (
             MaybeUninit::<usize>::uninit(),

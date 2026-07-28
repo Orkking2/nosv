@@ -1,7 +1,7 @@
 //! Safe, futures-based access to the nOS-V task runtime.
 //!
 //! The crate deliberately keeps nOS-V descriptors private. Spawned futures are
-//! `Send + 'static` because an nOS-V task may resume on another worker pthread;
+//! `Send + 'static` because a nOS-v task may resume on another worker pthread;
 //! a root future passed to [`Runtime::block_on`] may borrow local state and need
 //! not be `Send` because it remains on the attached calling thread.
 //!
@@ -11,6 +11,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
+#![warn(clippy::missing_docs_in_private_items)]
 
 mod ffi;
 
@@ -35,6 +36,18 @@ pub use task::{AbortHandle, JoinHandle, TaskBuilder};
 pub use topology::{CpuId, DomainId, NumaNodeId, Topology, TopologyLevel};
 
 /// Creates a task on the runtime currently polling this future.
+///
+/// This crate-root convenience function is equivalent to [`task::spawn`]. A current runtime exists
+/// only while [`Runtime::block_on`] is polling its root future or a nOS-V task callback is polling a
+/// spawned future. Code that already owns a [`Handle`] should use [`Handle::spawn`] explicitly.
+///
+/// Dropping the returned [`JoinHandle`] detaches the task; call [`JoinHandle::abort`] to request
+/// cooperative cancellation.
+///
+/// # Errors
+///
+/// Returns [`SpawnError::RuntimeClosed`] outside a current runtime context, or forwards validation,
+/// fork-safety, lifecycle, and native creation errors from the runtime.
 pub fn spawn<F, T>(future: F) -> Result<JoinHandle<T>, SpawnError>
 where
     F: std::future::Future<Output = T> + Send + 'static,
@@ -44,6 +57,7 @@ where
 }
 
 #[cfg(test)]
+/// Compile-time assertions for the runtime's thread-safety boundary.
 mod trait_tests {
     use super::*;
     use static_assertions::{assert_impl_all, assert_not_impl_any};

@@ -13,11 +13,17 @@ use std::{
     task::{Context, Poll},
 };
 
-struct WakeMany(u32);
+/// Self-waking future used to stress repeated suspend/resubmit epochs.
+struct WakeMany(
+    /// Number of pending/self-wake cycles remaining.
+    u32,
+);
 
 impl Future for WakeMany {
+    /// The stress future produces no value.
     type Output = ();
 
+    /// Consumes one cycle, wakes itself, and becomes ready when all cycles finish.
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
         if self.0 == 0 {
             Poll::Ready(())
@@ -29,13 +35,19 @@ impl Future for WakeMany {
     }
 }
 
+/// Future whose captured waker is exercised concurrently by foreign pthreads.
 struct ExternalWake {
+    /// Release flag written after the wake storm has completed.
     ready: Arc<AtomicBool>,
+    /// Slot through which the test extracts the executor-created waker.
     slot: Arc<Mutex<Option<std::task::Waker>>>,
 }
 
 impl Future for ExternalWake {
+    /// The cross-thread wake check produces no value.
     type Output = ();
+
+    /// Completes after release or refreshes the externally accessible waker slot.
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
         if self.ready.load(Ordering::Acquire) {
             Poll::Ready(())
@@ -46,24 +58,41 @@ impl Future for ExternalWake {
     }
 }
 
-struct ReadyWithWaker(Arc<Mutex<Option<std::task::Waker>>>);
+/// Ready future that deliberately leaves a cloned waker alive after completion.
+struct ReadyWithWaker(
+    /// Storage used to fire the stale waker after native descriptor retirement.
+    Arc<Mutex<Option<std::task::Waker>>>,
+);
 
 impl Future for ReadyWithWaker {
+    /// The stale-waker setup produces no value.
     type Output = ();
+
+    /// Captures the current waker and completes in the same poll epoch.
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
         *self.0.lock().unwrap() = Some(context.waker().clone());
         Poll::Ready(())
     }
 }
 
-struct DropFlag(Arc<AtomicBool>);
+/// Output value that records when a detached task's result is destroyed.
+struct DropFlag(
+    /// Flag set by the destructor with release ordering.
+    Arc<AtomicBool>,
+);
 
 impl Drop for DropFlag {
+    /// Publishes proof that detached output cleanup ran before runtime shutdown returned.
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
     }
 }
 
+/// Exercises the complete public v0.1 lifecycle against a real nOS-V installation.
+///
+/// The scenario covers fork guards, topology and memory queries, a borrowed root future, task
+/// attributes, self/foreign/stale wakes, detached outputs, panic capture, cooperative abort, timer
+/// ordering and cancellation, shutdown draining, closed capabilities, and full reinitialization.
 #[test]
 fn runtime_spawn_join_abort_and_reinitialize() {
     let runtime = Runtime::new().expect("initialize nOS-V");
