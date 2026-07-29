@@ -421,6 +421,7 @@ struct CqeContext<C: cqueue::EntryMarker> {
     /// Whether the cancellation context targeting this original has retired.
     cancel_seen: bool,
 }
+
 /// Pending request to create and stage an `AsyncCancel` SQE.
 struct CancelCommand<C: cqueue::EntryMarker> {
     /// Stable pointer of the original context to cancel.
@@ -432,6 +433,7 @@ struct CancelCommand<C: cqueue::EntryMarker> {
     /// Submission to which the cancellation result belongs.
     state: Arc<SubmissionState<C>>,
 }
+
 /// State serialized across all producers and the sole CQ consumer.
 struct DriverData<C: cqueue::EntryMarker> {
     /// Live contexts keyed by the pointer stored in kernel `user_data`.
@@ -466,6 +468,7 @@ enum DriverPark {
     /// The completion callback destroyed the native descriptor.
     Destroyed,
 }
+
 /// Native task descriptor and lost-wakeup prevention state.
 struct DriverGate {
     /// Driver task descriptor after successful native creation.
@@ -478,7 +481,7 @@ struct DriverGate {
 
 /// A validated ring prepared before native runtime initialization.
 ///
-/// Building the ring first lets [`crate::runtime::RuntimeBuilder`] reject local
+/// Building the ring first lets [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) reject local
 /// configuration or kernel capability errors without partly initializing nOS-V.
 pub(crate) struct PreparedRing<S: squeue::EntryMarker, C: cqueue::EntryMarker> {
     /// Kernel ring created with the selected entry marker types.
@@ -496,8 +499,8 @@ impl<S: squeue::EntryMarker, C: cqueue::EntryMarker> PreparedRing<S, C> {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::InitError::InvalidIoUringConfig`] for invalid settings,
-    /// or [`crate::InitError::IoUring`] when creation, probing, or a required
+    /// Returns [`InvalidIoUringConfig`](crate::InitError::InvalidIoUringConfig) for invalid settings,
+    /// or [`IoUring`](crate::InitError::IoUring) when creation, probing, or a required
     /// kernel capability fails.
     pub(crate) fn new(config: IoUringConfig) -> Result<Self, crate::InitError> {
         let config = config
