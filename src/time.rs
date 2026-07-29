@@ -642,28 +642,20 @@ mod tests {
     use super::*;
     use std::{
         future::Future,
-        sync::Arc,
-        task::{Context, Wake, Waker},
+        task::{Context, Waker},
     };
-
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
 
     #[test]
     fn expired_sleep_is_ready_without_a_runtime() {
         let mut sleep = Box::pin(sleep(Duration::ZERO));
-        let waker = Waker::from(Arc::new(Noop));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         assert_eq!(sleep.as_mut().poll(&mut context), Poll::Ready(()));
     }
 
     #[test]
     fn ready_operation_wins_a_simultaneous_timeout() {
         let mut timeout = Box::pin(timeout(Duration::ZERO, std::future::ready(42)));
-        let waker = Waker::from(Arc::new(Noop));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         assert_eq!(timeout.as_mut().poll(&mut context), Poll::Ready(Ok(42)));
     }
 }
