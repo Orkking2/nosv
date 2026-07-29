@@ -2,7 +2,7 @@
 name = "nosv"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 license = "GPL-3.0-only"
 description = "A safe Rust runtime and async executor for nOS-V"
 readme = "README.md"
@@ -11,12 +11,16 @@ readme = "README.md"
 libc = "0.2"
 nosv-sys = { path = "../nosv-sys" }
 uring = { package = "io-uring", git = "https://github.com/Orkking2/io-uring.git", rev = "928e28ae35fe16d652a6cc52de71add50297a32e", optional = true }
+socket2 = { version = "0.6", features = ["all"], optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util"], optional = true }
+ubq = { version = "5", optional = true }
 
 [features]
 default = ["rt", "time", "io-uring"]
 rt = []
 time = ["rt"]
-io-uring = ["rt", "dep:uring"]
+io-uring = ["rt", "dep:socket2", "dep:ubq", "dep:uring"]
+tokio-compat = ["io-uring", "dep:tokio"]
 futures-io = ["io-uring"]
 native-sync = []
 

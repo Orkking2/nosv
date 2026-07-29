@@ -40,5 +40,16 @@ original-CQE draining for an owned long timeout. Wall-clock time is used only as
 guard.
 
 GitHub Actions pins both native dependencies and uses `ubuntu-24.04`. Pull requests run the full
-required matrix and Rust 1.85 checks. A scheduled sanitized build repeats cancellation, wake, and
+required matrix and Rust 1.92 checks. A scheduled sanitized build repeats cancellation, wake, and
 shutdown races under nOS-V ASan/UBSan instrumentation.
+
+## Safe I/O layers
+
+`tests/io_layers.rs` serializes native runtime tests for owned-buffer file I/O,
+append validation, large entry-width erasure, numeric TCP fallback, loopback
+send/receive, pending-accept cancellation, and the optional Tokio extension
+traits. Run the Tokio-specific gate with:
+
+```text
+cargo test --features tokio-compat --test io_layers -- --test-threads=1
+```

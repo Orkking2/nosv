@@ -82,6 +82,9 @@ pub(crate) struct RuntimeCore {
     #[cfg(feature = "time")]
     /// Single timer driver and command heap for this runtime.
     pub(crate) timer: Arc<crate::time::TimerDriver>,
+    #[cfg(feature = "io-uring")]
+    /// Entry-width-erased completion-native I/O capability.
+    pub(crate) io: Arc<dyn crate::io::ErasedOwnedDriver>,
     /// Authoritative lifecycle and task-registry mutex.
     pub(crate) state: Mutex<RuntimeState>,
     /// Wakes shutdown after the final registered task callback has finished.
@@ -356,6 +359,8 @@ impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> RuntimeBuilder<S, C> 
             timer_type,
             #[cfg(feature = "time")]
             timer,
+            #[cfg(feature = "io-uring")]
+            io: io_uring.clone(),
             state: Mutex::new(RuntimeState {
                 lifecycle: Lifecycle::Running,
                 tasks: HashMap::new(),
@@ -431,6 +436,15 @@ impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> Runtime<S, C> {
     #[cfg(feature = "io-uring")]
     pub fn io_uring_handle(&self) -> crate::io_uring::IoUringHandle<S, C> {
         crate::io_uring::IoUringHandle::new(self.io_uring.clone(), &self.core)
+    }
+
+    /// Clones the non-generic completion-native I/O capability.
+    #[cfg(feature = "io-uring")]
+    pub fn io_handle(&self) -> crate::io::IoHandle {
+        crate::io::IoHandle {
+            driver: self.core.io.clone(),
+            core: Arc::downgrade(&self.core),
+        }
     }
 
     /// Drives a possibly borrowed, non-`Send` root future on the owner pthread.
@@ -673,6 +687,20 @@ impl Handle {
         self.core.ensure_running()?;
         Ok(Topology {
             runtime: Arc::downgrade(&self.core),
+        })
+    }
+
+    /// Returns the non-generic completion-native I/O capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeClosed`] after shutdown or in a forked child.
+    #[cfg(feature = "io-uring")]
+    pub fn io_handle(&self) -> Result<crate::io::IoHandle, RuntimeClosed> {
+        self.core.ensure_running()?;
+        Ok(crate::io::IoHandle {
+            driver: self.core.io.clone(),
+            core: Arc::downgrade(&self.core),
         })
     }
 

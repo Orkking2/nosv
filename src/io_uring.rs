@@ -55,7 +55,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::{ffi, runtime::RuntimeCore, util::lock};
+use crate::{
+    ffi,
+    io::{ErasedOwnedDriver, OwnedControl, OwnedHandler, QueuedOwnedOp, unsupported_opcode_error},
+    runtime::RuntimeCore,
+    util::lock,
+};
 use std::{
     collections::{HashMap, VecDeque},
     error::Error,
@@ -439,15 +444,61 @@ struct DriverData<C: cqueue::EntryMarker> {
     /// Live contexts keyed by the pointer stored in kernel `user_data`.
     contexts: HashMap<u64, Box<CqeContext<C>>>,
     /// Context pointers in SQ order not yet known to be accepted.
-    staged: VecDeque<u64>,
+    staged: VecDeque<StagedContext>,
     /// Cancellation commands waiting for free SQ slots.
     cancel_queue: VecDeque<CancelCommand<C>>,
+    /// Completion-native original contexts keyed by kernel user data.
+    owned_contexts: HashMap<u64, Box<OwnedCqeContext>>,
+    /// Completion-native cancellation contexts keyed by kernel user data.
+    owned_cancel_contexts: HashMap<u64, Box<OwnedCancelContext>>,
+    /// Records popped from UBQ but not yet staged because the SQ was full.
+    owned_pending: VecDeque<QueuedOwnedOp>,
+    /// Cancellation commands for staged completion-native operations.
+    owned_cancel_queue: VecDeque<OwnedCancelCommand>,
     /// Weak registry used to cancel submissions during runtime shutdown.
     submissions: Vec<Weak<SubmissionState<C>>>,
     /// Whether submission futures may admit more original SQEs.
     accepting: bool,
     /// Whether the driver should stop once every work queue is empty.
     shutdown: bool,
+}
+
+/// Completion-native context retaining resources until the original CQE.
+struct OwnedCqeContext {
+    /// Submission/completion phase of the original SQE.
+    phase: ContextPhase,
+    /// Shared cancellation identity.
+    control: Arc<OwnedControl>,
+    /// Operation resources, consumed by terminal completion.
+    handler: Option<Box<dyn OwnedHandler>>,
+    /// Whether an AsyncCancel command was generated.
+    cancel_queued: bool,
+    /// Whether the corresponding cancellation CQE retired.
+    cancel_seen: bool,
+}
+
+/// Pending cancellation for a completion-native context.
+struct OwnedCancelCommand {
+    /// Stable original context pointer targeted by AsyncCancel.
+    target: u64,
+}
+
+/// Stable context for one completion-native AsyncCancel SQE.
+struct OwnedCancelContext {
+    /// Submission/completion phase of this cancellation SQE.
+    phase: ContextPhase,
+    /// Original completion-native context pointer.
+    target: u64,
+}
+
+/// Identifies a userspace SQ entry awaiting kernel acceptance.
+enum StagedContext {
+    /// Existing raw API context.
+    Raw(u64),
+    /// Completion-native original context.
+    Owned(u64),
+    /// Completion-native cancellation context.
+    OwnedCancel(u64),
 }
 
 /// Native scheduling state protected by [`IoUringDriver::gate`].
@@ -488,6 +539,8 @@ pub(crate) struct PreparedRing<S: squeue::EntryMarker, C: cqueue::EntryMarker> {
     ring: IoUring<S, C>,
     /// Validated scheduling and buffering policy retained by the driver.
     config: IoUringConfig,
+    /// Opcode support retained from the kernel probe.
+    supported: [bool; 256],
 }
 
 impl<S: squeue::EntryMarker, C: cqueue::EntryMarker> PreparedRing<S, C> {
@@ -531,7 +584,16 @@ impl<S: squeue::EntryMarker, C: cqueue::EntryMarker> PreparedRing<S, C> {
             )));
         }
 
-        Ok(Self { ring, config })
+        let mut supported = [false; 256];
+        for code in u8::MIN..=u8::MAX {
+            supported[usize::from(code)] = probe.is_supported(code);
+        }
+
+        Ok(Self {
+            ring,
+            config,
+            supported,
+        })
     }
 }
 
@@ -580,7 +642,8 @@ where
     /// Polling the returned [`SubmitEntries`] fills available SQ slots and wakes
     /// the shared driver. It resolves to a [`CompletionStream`] only after the
     /// iterator ends and all yielded SQEs have been accepted. The iterator is not
-    /// eagerly collected, so it can be much larger than [`IoUringConfig::entries`].
+    /// eagerly collected, so it can be much larger than [`IoUringConfig`](IoUringConfig::entries)
+    /// specifies.
     ///
     /// If admission stops after accepting a prefix, [`SubmissionError`] retains
     /// the cancellation and drain capability for that prefix. Dropping the
@@ -680,6 +743,7 @@ where
         // SAFETY: no field is structurally pinned and the iterator is never moved out while pinned.
         let this = unsafe { self.get_unchecked_mut() };
         assert!(!this.done, "SubmitEntries polled after completion");
+
         if !this.closed {
             let iterator = this.iterator.as_mut().expect("live admission iterator");
             this.driver.admit(
@@ -689,43 +753,46 @@ where
                 &this.state,
             );
         }
-        let mut state = lock(&this.state.inner);
-        let failure = if state.delivery == Delivery::Overflow {
-            Some(SubmissionErrorKind::CompletionBufferOverflow)
-        } else if this.closed
-            || state.delivery == Delivery::Cancelling
-            || state.delivery == Delivery::Detached
+
         {
-            Some(SubmissionErrorKind::RuntimeClosed)
-        } else {
-            None
-        };
-        if let Some(kind) = failure {
-            this.done = true;
-            this.iterator.take();
-            this.pending.take();
-            drop(state);
-            this.driver
-                .request_cancel(&this.state, Delivery::Cancelling);
-            return Poll::Ready(Err(SubmissionError {
-                kind,
-                cancellation: Cancellation::new(this.driver.clone(), this.state.clone()),
-            }));
+            let mut state = lock(&this.state.inner);
+            let failure = if state.delivery == Delivery::Overflow {
+                Some(SubmissionErrorKind::CompletionBufferOverflow)
+            } else if this.closed
+                || state.delivery == Delivery::Cancelling
+                || state.delivery == Delivery::Detached
+            {
+                Some(SubmissionErrorKind::RuntimeClosed)
+            } else {
+                None
+            };
+            if let Some(kind) = failure {
+                this.done = true;
+                this.iterator.take();
+                this.pending.take();
+                drop(state);
+                this.driver
+                    .request_cancel(&this.state, Delivery::Cancelling);
+                return Poll::Ready(Err(SubmissionError {
+                    kind,
+                    cancellation: Cancellation::new(this.driver.clone(), this.state.clone()),
+                }));
+            }
+            if state.iterator_finished && state.accepted == state.originals {
+                this.done = true;
+                this.iterator.take();
+                this.pending.take();
+                drop(state);
+                return Poll::Ready(Ok(CompletionStream {
+                    driver: this.driver.clone(),
+                    state: this.state.clone(),
+                    active: true,
+                    _sqe: PhantomData,
+                }));
+            }
+            replace_waker(&mut state.admission_waker, cx.waker());
         }
-        if state.iterator_finished && state.accepted == state.originals {
-            this.done = true;
-            this.iterator.take();
-            this.pending.take();
-            drop(state);
-            return Poll::Ready(Ok(CompletionStream {
-                driver: this.driver.clone(),
-                state: this.state.clone(),
-                active: true,
-                _sqe: PhantomData,
-            }));
-        }
-        replace_waker(&mut state.admission_waker, cx.waker());
-        drop(state);
+
         this.driver.notify();
         Poll::Pending
     }
@@ -781,6 +848,7 @@ where
     pub fn next(&mut self) -> NextCompletion<'_, C> {
         NextCompletion { state: &self.state }
     }
+
     /// Closes original-CQE delivery and requests cancellation of live work.
     ///
     /// One `IORING_OP_ASYNC_CANCEL` request is queued for each non-terminal
@@ -792,6 +860,7 @@ where
         self.active = false;
         self.driver
             .request_cancel(&self.state, Delivery::Cancelling);
+
         Cancellation::new(self.driver.clone(), self.state.clone())
     }
 }
@@ -827,15 +896,18 @@ impl<C: cqueue::EntryMarker> Future for NextCompletion<'_, C> {
         if let Some(cqe) = state.normal.pop_front() {
             return Poll::Ready(Some(Ok(cqe)));
         }
+
         if state.normal_overflow {
             state.normal_overflow = false;
             return Poll::Ready(Some(Err(CompletionError::BufferOverflow)));
         }
+
         if state.delivery != Delivery::Open
             || (state.iterator_finished && state.original_terminal == state.originals)
         {
             return Poll::Ready(None);
         }
+
         replace_waker(&mut state.normal_waker, cx.waker());
         Poll::Pending
     }
@@ -968,6 +1040,12 @@ impl<C: cqueue::EntryMarker> Future for WaitDrained<'_, C> {
 pub(crate) struct IoUringDriver<S: squeue::EntryMarker, C: cqueue::EntryMarker> {
     /// Context registry, pending queues, and admission/shutdown flags.
     data: Mutex<DriverData<C>>,
+    /// Lock-free queue receiving owned operations from concurrent tasks.
+    owned_queue: Arc<ubq::UBQ<QueuedOwnedOp>>,
+    /// Synchronizes owned admission with shutdown closure.
+    owned_admission: Mutex<bool>,
+    /// Retained opcode support for high-level validation.
+    supported: [bool; 256],
     /// Ring removed exactly once when the driver reaches terminal shutdown.
     ring: Mutex<Option<IoUring<S, C>>>,
     /// Validated queue, polling, and buffering policy.
@@ -1005,10 +1083,17 @@ where
                 contexts: HashMap::new(),
                 staged: VecDeque::new(),
                 cancel_queue: VecDeque::new(),
+                owned_contexts: HashMap::new(),
+                owned_cancel_contexts: HashMap::new(),
+                owned_pending: VecDeque::new(),
+                owned_cancel_queue: VecDeque::new(),
                 submissions: Vec::new(),
                 accepting: true,
                 shutdown: false,
             }),
+            owned_queue: ubq::UBQ::new_arc(),
+            owned_admission: Mutex::new(true),
+            supported: prepared.supported,
             ring: Mutex::new(Some(prepared.ring)),
             config: prepared.config,
             gate: Mutex::new(DriverGate {
@@ -1093,6 +1178,14 @@ where
                 self.request_cancel(state, Delivery::Cancelling);
                 return;
             }
+            if !data.owned_pending.is_empty()
+                || !data.owned_cancel_queue.is_empty()
+                || !self.owned_queue.is_empty()
+            {
+                drop(data);
+                self.notify();
+                return;
+            }
             let mut ring_guard = lock(&self.ring);
             let ring = ring_guard
                 .as_mut()
@@ -1145,7 +1238,7 @@ where
                     break;
                 }
                 data.contexts.insert(pointer, boxed);
-                data.staged.push_back(pointer);
+                data.staged.push_back(StagedContext::Raw(pointer));
                 lock(&state.inner).originals += 1;
                 notify = true;
             }
@@ -1176,6 +1269,7 @@ where
                 submission.cancel_waker = None;
             }
         }
+
         let mut data = lock(&self.data);
         let targets = data
             .contexts
@@ -1205,6 +1299,29 @@ where
             lock(&state.inner).cancels += count;
         }
         drop(data);
+        self.notify();
+    }
+
+    /// Targets an owned operation if its queued-to-staged handoff already won.
+    fn request_owned_cancel(&self, control: &Arc<OwnedControl>) {
+        {
+            let mut data = lock(&self.data);
+            let target = data.owned_contexts.iter().find_map(|(&pointer, context)| {
+                (Arc::ptr_eq(&context.control, control)
+                    && context.phase != ContextPhase::Terminal
+                    && !context.cancel_queued)
+                    .then_some(pointer)
+            });
+            if let Some(target) = target {
+                let context = data
+                    .owned_contexts
+                    .get_mut(&target)
+                    .expect("collected owned context");
+                context.cancel_queued = true;
+                data.owned_cancel_queue
+                    .push_back(OwnedCancelCommand { target });
+            }
+        }
         self.notify();
     }
 
@@ -1254,7 +1371,7 @@ where
                 ffi::flush_submit_window()
                     .unwrap_or_else(|_| invariant_abort("submit window flush failed"));
             }
-            let decision = decide(&lock(&self.data), backlog);
+            let decision = decide(&lock(&self.data), backlog, self.owned_queue.is_empty());
             if decision == RunDecision::Stop {
                 drop(lock(&self.ring).take());
                 lock(&self.gate).phase = DriverPark::Terminal;
@@ -1300,30 +1417,62 @@ where
     fn pass(&self) -> (Vec<Waker>, bool) {
         let mut wakes = Vec::new();
 
-        {
+        let failed = {
             let mut data = lock(&self.data);
             let mut ring_guard = lock(&self.ring);
             let ring = ring_guard
                 .as_mut()
                 .unwrap_or_else(|| invariant_abort("ring missing during submit"));
-            // SAFETY: the data mutex serializes every SQ producer.
-            let mut sq = unsafe { ring.submission_shared() };
-            sq.sync();
-            stage_cancellations::<S, C>(&mut data, &mut sq);
-            drop(sq);
+
+            let failed = {
+                // SAFETY: the data mutex serializes every SQ producer.
+                let mut sq = unsafe { ring.submission_shared() };
+                sq.sync();
+                stage_cancellations::<S, C>(&mut data, &mut sq);
+                stage_owned_cancellations::<S, C>(&mut data, &mut sq);
+                stage_owned::<S, C>(
+                    &mut data,
+                    &self.owned_queue,
+                    &self.supported,
+                    &mut sq,
+                    self.config.entries as usize,
+                )
+            };
+
             submit_staged(&mut data, ring, &mut wakes);
-        }
+            if data.owned_pending.is_empty()
+                && data.owned_cancel_queue.is_empty()
+                && self.owned_queue.is_empty()
+            {
+                for state in data.submissions.iter().filter_map(Weak::upgrade) {
+                    let mut submission = lock(&state.inner);
+                    if !submission.iterator_finished
+                        && let Some(waker) = submission.admission_waker.take()
+                    {
+                        wakes.push(waker);
+                    }
+                }
+            }
+
+            failed
+        };
+
+        fail_owned(failed, &mut wakes);
 
         let (cqes, backlog) = {
             let ring_guard = lock(&self.ring);
             let ring = ring_guard
                 .as_ref()
                 .unwrap_or_else(|| invariant_abort("ring missing during reap"));
+            
             // SAFETY: only the non-parallel driver consumes this CQ.
             let mut cq = unsafe { ring.completion_shared() };
+            
             cq.sync();
+            
             let values = cq.by_ref().take(self.config.reap_size).collect::<Vec<_>>();
             let backlog = values.len() == self.config.reap_size || !cq.is_empty();
+            
             (values, backlog)
         };
 
@@ -1333,10 +1482,76 @@ where
                 overflow.push(state);
             }
         }
+
         for state in overflow {
             self.request_cancel(&state, Delivery::Overflow);
         }
+        
         (wakes, backlog)
+    }
+
+    /// Routes one CQE to the raw or completion-native context registry.
+    fn dispatch(&self, cqe: C, wakes: &mut Vec<Waker>) -> Option<Arc<SubmissionState<C>>> {
+        let pointer = cqe.user_data();
+        if lock(&self.data).contexts.contains_key(&pointer) {
+            self.dispatch_raw(cqe, wakes)
+        } else {
+            let common: cqueue::Entry = cqe.into();
+            self.dispatch_owned(common, wakes);
+            None
+        }
+    }
+
+    /// Completes an owned original or retires its invisible cancellation CQE.
+    fn dispatch_owned(&self, cqe: cqueue::Entry, wakes: &mut Vec<Waker>) {
+        let pointer = cqe.user_data();
+        if pointer == 0 {
+            invariant_abort("null owned CQE context pointer");
+        }
+        let more = cqueue::more(cqe.flags());
+        let handler = {
+            let mut data = lock(&self.data);
+            if let Some(mut context) = data.owned_contexts.remove(&pointer) {
+                if context.phase != ContextPhase::Submitted {
+                    invariant_abort("CQE for unsubmitted owned context");
+                }
+                if more {
+                    invariant_abort("multishot completion-native CQE");
+                }
+                context.phase = ContextPhase::Terminal;
+                let handler = context
+                    .handler
+                    .take()
+                    .unwrap_or_else(|| invariant_abort("owned handler completed twice"));
+                if context.cancel_queued && !context.cancel_seen {
+                    data.owned_contexts.insert(pointer, context);
+                }
+                Some(handler)
+            } else if let Some(context) = data.owned_cancel_contexts.remove(&pointer) {
+                if context.phase != ContextPhase::Submitted {
+                    invariant_abort("CQE for unsubmitted owned cancellation");
+                }
+                if more {
+                    invariant_abort("multishot owned cancellation CQE");
+                }
+                let original = data
+                    .owned_contexts
+                    .get_mut(&context.target)
+                    .unwrap_or_else(|| invariant_abort("owned cancel target disappeared"));
+                original.cancel_seen = true;
+                if original.phase == ContextPhase::Terminal {
+                    data.owned_contexts.remove(&context.target);
+                }
+                None
+            } else {
+                invariant_abort("unknown or duplicate owned CQE pointer");
+            }
+        };
+        if let Some(handler) = handler
+            && let Some(waker) = handler.complete(cqe.result())
+        {
+            wakes.push(waker);
+        }
     }
 
     /// Routes one typed CQE through its pointer context and updates retirement.
@@ -1348,7 +1563,7 @@ where
     ///
     /// Returns the submission state only when original delivery first overflows;
     /// the caller then requests cancellation outside this dispatch operation.
-    fn dispatch(&self, mut cqe: C, wakes: &mut Vec<Waker>) -> Option<Arc<SubmissionState<C>>> {
+    fn dispatch_raw(&self, mut cqe: C, wakes: &mut Vec<Waker>) -> Option<Arc<SubmissionState<C>>> {
         let pointer = cqe.user_data();
 
         if pointer == 0 {
@@ -1371,80 +1586,94 @@ where
         match context.kind {
             ContextKind::Original => {
                 let mut overflow = None;
-                let mut state = lock(&context.state.inner);
-                if !state.iterator_finished {
-                    if let Some(waker) = state.admission_waker.take() {
+
+                {
+                    let mut state = lock(&context.state.inner);
+                    if !state.iterator_finished
+                        && let Some(waker) = state.admission_waker.take()
+                    {
                         wakes.push(waker);
                     }
-                }
-                if state.delivery == Delivery::Open {
-                    if state.normal.len() < context.state.limit {
-                        state.normal.push_back(Completion {
-                            index: context.index,
-                            cqe,
-                        });
-                    } else if !state.normal_overflow {
-                        state.normal_overflow = true;
-                        state.delivery = Delivery::Overflow;
-                        overflow = Some(context.state.clone());
-                    }
-                    if let Some(waker) = state.normal_waker.take() {
-                        wakes.push(waker);
-                    }
-                }
-                if !more {
-                    context.phase = ContextPhase::Terminal;
-                    state.original_terminal += 1;
-                    if state.original_terminal == state.originals {
+
+                    if state.delivery == Delivery::Open {
+                        if state.normal.len() < context.state.limit {
+                            state.normal.push_back(Completion {
+                                index: context.index,
+                                cqe,
+                            });
+                        } else if !state.normal_overflow {
+                            state.normal_overflow = true;
+                            state.delivery = Delivery::Overflow;
+                            overflow = Some(context.state.clone());
+                        }
                         if let Some(waker) = state.normal_waker.take() {
                             wakes.push(waker);
                         }
                     }
-                    wake_drain(&mut state, wakes);
+
+                    if !more {
+                        context.phase = ContextPhase::Terminal;
+                        state.original_terminal += 1;
+                        if state.original_terminal == state.originals
+                            && let Some(waker) = state.normal_waker.take()
+                        {
+                            wakes.push(waker);
+                        }
+                        wake_drain(&mut state, wakes);
+                    }
                 }
-                drop(state);
+
                 if more || (context.cancel_queued && !context.cancel_seen) {
                     data.contexts.insert(pointer, context);
                 }
                 overflow
             }
+
             ContextKind::Cancel => {
                 if more {
                     invariant_abort("multishot cancellation CQE");
                 }
+
                 let target = context
                     .target
                     .unwrap_or_else(|| invariant_abort("cancel context without target"));
-                let mut state = lock(&context.state.inner);
-                if state.delivery != Delivery::Detached {
-                    if state.cancellations.len() < context.state.limit {
-                        state.cancellations.push_back(Completion {
-                            index: context.index,
-                            cqe,
-                        });
-                    } else {
-                        state.cancel_overflow = true;
+
+                {
+                    let mut state = lock(&context.state.inner);
+                    if state.delivery != Delivery::Detached {
+                        if state.cancellations.len() < context.state.limit {
+                            state.cancellations.push_back(Completion {
+                                index: context.index,
+                                cqe,
+                            });
+                        } else {
+                            state.cancel_overflow = true;
+                        }
+                        if let Some(waker) = state.cancel_waker.take() {
+                            wakes.push(waker);
+                        }
                     }
-                    if let Some(waker) = state.cancel_waker.take() {
+
+                    state.cancel_terminal += 1;
+                    if state.cancel_terminal == state.cancels
+                        && let Some(waker) = state.cancel_waker.take()
+                    {
                         wakes.push(waker);
                     }
+
+                    wake_drain(&mut state, wakes);
                 }
-                state.cancel_terminal += 1;
-                if state.cancel_terminal == state.cancels {
-                    if let Some(waker) = state.cancel_waker.take() {
-                        wakes.push(waker);
-                    }
-                }
-                wake_drain(&mut state, wakes);
-                drop(state);
+
                 let original = data
                     .contexts
                     .get_mut(&target)
                     .unwrap_or_else(|| invariant_abort("cancel target disappeared"));
+
                 original.cancel_seen = true;
                 if original.phase == ContextPhase::Terminal {
                     data.contexts.remove(&target);
                 }
+
                 None
             }
         }
@@ -1456,17 +1685,29 @@ where
     /// cancellation context has reached a terminal CQE, the ring has been
     /// dropped, and the native completion callback has destroyed the task.
     pub(crate) fn shutdown_and_wait(&self) {
-        let submissions = {
+        *lock(&self.owned_admission) = false;
+        let (submissions, owned) = {
             let mut data = lock(&self.data);
             data.accepting = false;
             data.shutdown = true;
-            data.submissions
+            let submissions = data
+                .submissions
                 .iter()
                 .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let owned = data
+                .owned_contexts
+                .values()
+                .filter(|context| context.phase != ContextPhase::Terminal)
+                .map(|context| context.control.clone())
+                .collect::<Vec<_>>();
+            (submissions, owned)
         };
         for state in submissions {
             self.request_cancel(&state, Delivery::Detached);
+        }
+        for control in owned {
+            self.request_owned_cancel(&control);
         }
         self.notify();
         let mut completed = lock(&self.completed);
@@ -1497,6 +1738,38 @@ where
         }
         *lock(&self.completed) = true;
         self.completed_cv.notify_all();
+    }
+}
+
+impl<S, C> ErasedOwnedDriver for IoUringDriver<S, C>
+where
+    S: squeue::EntryMarker + Send + 'static,
+    C: cqueue::EntryMarker + Send + 'static,
+{
+    fn enqueue(&self, operation: QueuedOwnedOp) -> Result<(), QueuedOwnedOp> {
+        let admission = lock(&self.owned_admission);
+        if !*admission {
+            return Err(operation);
+        }
+        self.owned_queue.push(operation);
+        drop(admission);
+        self.notify();
+        Ok(())
+    }
+
+    fn enqueue_batch(&self, operations: Vec<QueuedOwnedOp>) -> Result<(), Vec<QueuedOwnedOp>> {
+        let admission = lock(&self.owned_admission);
+        if !*admission {
+            return Err(operations);
+        }
+        self.owned_queue.push_batch(operations);
+        drop(admission);
+        self.notify();
+        Ok(())
+    }
+
+    fn cancel(&self, control: &Arc<OwnedControl>) {
+        self.request_owned_cancel(control);
     }
 }
 
@@ -1532,7 +1805,120 @@ fn stage_cancellations<S: squeue::EntryMarker, C: cqueue::EntryMarker>(
             break;
         }
         data.contexts.insert(pointer, boxed);
-        data.staged.push_back(pointer);
+        data.staged.push_back(StagedContext::Raw(pointer));
+    }
+}
+
+/// Reason a queued owned operation completed before submission.
+#[derive(Clone, Copy)]
+enum OwnedFailure {
+    /// Runtime admission was closed.
+    Closed,
+    /// The operation was cancelled while queued.
+    Cancelled,
+    /// The retained probe reports no opcode support.
+    Unsupported,
+}
+
+/// Stages completion-native cancellation commands before new originals.
+fn stage_owned_cancellations<S: squeue::EntryMarker, C: cqueue::EntryMarker>(
+    data: &mut DriverData<C>,
+    sq: &mut uring::SubmissionQueue<'_, S>,
+) {
+    while let Some(command) = data.owned_cancel_queue.pop_front() {
+        let boxed = Box::new(OwnedCancelContext {
+            phase: ContextPhase::Staged,
+            target: command.target,
+        });
+        let pointer = (&*boxed as *const OwnedCancelContext) as usize as u64;
+        if context_pointer_in_use(data, pointer) {
+            invariant_abort("reused live owned cancellation pointer");
+        }
+        let mut entry = S::from(opcode::AsyncCancel::new(command.target).build());
+        entry.set_user_data(pointer);
+        // SAFETY: the original owned context is retained until both CQEs retire.
+        if unsafe { sq.push(&entry) }.is_err() {
+            data.owned_cancel_queue.push_front(command);
+            break;
+        }
+        data.owned_cancel_contexts.insert(pointer, boxed);
+        data.staged.push_back(StagedContext::OwnedCancel(pointer));
+    }
+}
+
+/// Pops a bounded FIFO prefix from UBQ and stages supported owned operations.
+fn stage_owned<S: squeue::EntryMarker, C: cqueue::EntryMarker>(
+    data: &mut DriverData<C>,
+    queue: &ubq::UBQ<QueuedOwnedOp>,
+    supported: &[bool; 256],
+    sq: &mut uring::SubmissionQueue<'_, S>,
+    budget: usize,
+) -> Vec<(Box<dyn OwnedHandler>, OwnedFailure)> {
+    let mut failed = Vec::new();
+    for _ in 0..budget {
+        let operation = data.owned_pending.pop_front().or_else(|| queue.pop());
+        let Some(mut operation) = operation else {
+            break;
+        };
+
+        if data.shutdown {
+            failed.push((operation.handler, OwnedFailure::Closed));
+            continue;
+        }
+        if operation.control.is_cancelled() {
+            failed.push((operation.handler, OwnedFailure::Cancelled));
+            continue;
+        }
+        if !supported[usize::from(operation.handler.opcode())] {
+            failed.push((operation.handler, OwnedFailure::Unsupported));
+            continue;
+        }
+
+        let mut entry = S::from(operation.handler.entry());
+        let mut context = Box::new(OwnedCqeContext {
+            phase: ContextPhase::Staged,
+            control: operation.control,
+            handler: Some(operation.handler),
+            cancel_queued: false,
+            cancel_seen: false,
+        });
+        let pointer = (&*context as *const OwnedCqeContext) as usize as u64;
+        if context_pointer_in_use(data, pointer) {
+            invariant_abort("reused live owned context pointer");
+        }
+        entry.set_user_data(pointer);
+        // SAFETY: the boxed handler owns every resource referenced by this SQE.
+        if unsafe { sq.push(&entry) }.is_err() {
+            data.owned_pending.push_front(QueuedOwnedOp {
+                control: context.control.clone(),
+                handler: context.handler.take().expect("unstaged owned handler"),
+            });
+            break;
+        }
+        data.owned_contexts.insert(pointer, context);
+        data.staged.push_back(StagedContext::Owned(pointer));
+    }
+    failed
+}
+
+/// Reports whether a pointer collides with any live CQE allocation.
+fn context_pointer_in_use<C: cqueue::EntryMarker>(data: &DriverData<C>, pointer: u64) -> bool {
+    data.contexts.contains_key(&pointer)
+        || data.owned_contexts.contains_key(&pointer)
+        || data.owned_cancel_contexts.contains_key(&pointer)
+}
+
+/// Completes records discarded before submission, outside all driver locks.
+fn fail_owned(failed: Vec<(Box<dyn OwnedHandler>, OwnedFailure)>, wakes: &mut Vec<Waker>) {
+    for (handler, reason) in failed {
+        let error = match reason {
+            OwnedFailure::Closed => crate::io::runtime_closed_error(),
+            OwnedFailure::Cancelled => io::Error::from_raw_os_error(libc::ECANCELED),
+            OwnedFailure::Unsupported => unsupported_opcode_error(),
+        };
+        if let Some(waker) = handler.fail(error) {
+            wakes.push(waker);
+        }
     }
 }
 
@@ -1553,20 +1939,45 @@ fn submit_staged<S: squeue::EntryMarker, C: cqueue::EntryMarker>(
                 invariant_abort("kernel accepted unstaged SQEs");
             }
             for _ in 0..count {
-                let pointer = data.staged.pop_front().expect("validated staged prefix");
-                let context = data
-                    .contexts
-                    .get_mut(&pointer)
-                    .unwrap_or_else(|| invariant_abort("staged context disappeared"));
-                if context.phase != ContextPhase::Staged {
-                    invariant_abort("context submitted twice");
-                }
-                context.phase = ContextPhase::Submitted;
-                if context.kind == ContextKind::Original {
-                    let mut state = lock(&context.state.inner);
-                    state.accepted += 1;
-                    if let Some(waker) = state.admission_waker.take() {
-                        wakes.push(waker);
+                match data.staged.pop_front().expect("validated staged prefix") {
+                    StagedContext::Raw(pointer) => {
+                        let context = data
+                            .contexts
+                            .get_mut(&pointer)
+                            .unwrap_or_else(|| invariant_abort("staged raw context disappeared"));
+                        if context.phase != ContextPhase::Staged {
+                            invariant_abort("raw context submitted twice");
+                        }
+                        context.phase = ContextPhase::Submitted;
+                        if context.kind == ContextKind::Original {
+                            let mut state = lock(&context.state.inner);
+                            state.accepted += 1;
+                            if let Some(waker) = state.admission_waker.take() {
+                                wakes.push(waker);
+                            }
+                        }
+                    }
+                    StagedContext::Owned(pointer) => {
+                        let context = data
+                            .owned_contexts
+                            .get_mut(&pointer)
+                            .unwrap_or_else(|| invariant_abort("staged owned context disappeared"));
+                        if context.phase != ContextPhase::Staged {
+                            invariant_abort("owned context submitted twice");
+                        }
+                        context.phase = ContextPhase::Submitted;
+                    }
+                    StagedContext::OwnedCancel(pointer) => {
+                        let context =
+                            data.owned_cancel_contexts
+                                .get_mut(&pointer)
+                                .unwrap_or_else(|| {
+                                    invariant_abort("staged owned cancellation disappeared")
+                                });
+                        if context.phase != ContextPhase::Staged {
+                            invariant_abort("owned cancellation submitted twice");
+                        }
+                        context.phase = ContextPhase::Submitted;
                     }
                 }
             }
@@ -1593,13 +2004,29 @@ enum RunDecision {
 }
 
 /// Chooses how the driver should proceed from queue state and CQ backlog.
-fn decide<C: cqueue::EntryMarker>(data: &DriverData<C>, backlog: bool) -> RunDecision {
-    let active =
-        !data.contexts.is_empty() || !data.staged.is_empty() || !data.cancel_queue.is_empty();
+fn decide<C: cqueue::EntryMarker>(
+    data: &DriverData<C>,
+    backlog: bool,
+    owned_queue_empty: bool,
+) -> RunDecision {
+    let active = !data.contexts.is_empty()
+        || !data.staged.is_empty()
+        || !data.cancel_queue.is_empty()
+        || !data.owned_contexts.is_empty()
+        || !data.owned_cancel_contexts.is_empty()
+        || !data.owned_pending.is_empty()
+        || !data.owned_cancel_queue.is_empty()
+        || !owned_queue_empty;
 
     if data.shutdown && !active {
         RunDecision::Stop
-    } else if backlog || !data.staged.is_empty() || !data.cancel_queue.is_empty() {
+    } else if backlog
+        || !data.staged.is_empty()
+        || !data.cancel_queue.is_empty()
+        || !data.owned_pending.is_empty()
+        || !data.owned_cancel_queue.is_empty()
+        || !owned_queue_empty
+    {
         RunDecision::Yield
     } else if active {
         RunDecision::Wait
@@ -1620,10 +2047,10 @@ fn drained<C: cqueue::EntryMarker>(state: &SubmissionInner<C>) -> bool {
 
 /// Moves the registered drain waker to `wakes` once both terminal counts match.
 fn wake_drain<C: cqueue::EntryMarker>(state: &mut SubmissionInner<C>, wakes: &mut Vec<Waker>) {
-    if drained(state) {
-        if let Some(waker) = state.drain_waker.take() {
-            wakes.push(waker);
-        }
+    if drained(state)
+        && let Some(waker) = state.drain_waker.take()
+    {
+        wakes.push(waker);
     }
 }
 
@@ -1803,6 +2230,20 @@ mod tests {
         );
     }
 
+    /// Verifies FIFO order and gap-free exact-batch reservation in the owned queue.
+    #[test]
+    fn ubq_fifo_and_exact_batch_ordering() {
+        let queue = ubq::UBQ::new();
+        queue.push(0_u32);
+        queue.push_batch([1, 2, 3, 4]);
+        queue.push(5);
+        assert_eq!(
+            std::iter::from_fn(|| queue.pop()).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5],
+        );
+        assert!(queue.is_empty());
+    }
+
     /// Verifies that a boxed context has a usable pointer and retains user data.
     #[test]
     fn pointer_context_preserves_metadata() {
@@ -1828,14 +2269,18 @@ mod tests {
             contexts: HashMap::new(),
             staged: VecDeque::new(),
             cancel_queue: VecDeque::new(),
+            owned_contexts: HashMap::new(),
+            owned_cancel_contexts: HashMap::new(),
+            owned_pending: VecDeque::new(),
+            owned_cancel_queue: VecDeque::new(),
             submissions: Vec::new(),
             accepting: true,
             shutdown: false,
         };
-        assert_eq!(decide(&data, false), RunDecision::Pause);
-        assert_eq!(decide(&data, true), RunDecision::Yield);
+        assert_eq!(decide(&data, false, true), RunDecision::Pause);
+        assert_eq!(decide(&data, true, true), RunDecision::Yield);
         data.shutdown = true;
-        assert_eq!(decide(&data, false), RunDecision::Stop);
+        assert_eq!(decide(&data, false, true), RunDecision::Stop);
     }
     /// Minimal C-layout CQE prefix used to construct deterministic test entries.
     #[repr(C)]
@@ -1870,6 +2315,9 @@ mod tests {
     ) -> IoUringDriver<squeue::Entry, cqueue::Entry> {
         IoUringDriver {
             data: Mutex::new(data),
+            owned_queue: ubq::UBQ::new_arc(),
+            owned_admission: Mutex::new(true),
+            supported: [true; 256],
             ring: Mutex::new(None),
             config: IoUringConfig::default(),
             gate: Mutex::new(DriverGate {
@@ -1909,6 +2357,10 @@ mod tests {
             contexts,
             staged: VecDeque::new(),
             cancel_queue: VecDeque::new(),
+            owned_contexts: HashMap::new(),
+            owned_cancel_contexts: HashMap::new(),
+            owned_pending: VecDeque::new(),
+            owned_cancel_queue: VecDeque::new(),
             submissions: Vec::new(),
             accepting: true,
             shutdown: false,
@@ -1968,6 +2420,10 @@ mod tests {
             contexts,
             staged: VecDeque::new(),
             cancel_queue: VecDeque::new(),
+            owned_contexts: HashMap::new(),
+            owned_cancel_contexts: HashMap::new(),
+            owned_pending: VecDeque::new(),
+            owned_cancel_queue: VecDeque::new(),
             submissions: Vec::new(),
             accepting: true,
             shutdown: false,
@@ -2056,6 +2512,10 @@ mod tests {
             contexts,
             staged: VecDeque::new(),
             cancel_queue: VecDeque::new(),
+            owned_contexts: HashMap::new(),
+            owned_cancel_contexts: HashMap::new(),
+            owned_pending: VecDeque::new(),
+            owned_cancel_queue: VecDeque::new(),
             submissions: Vec::new(),
             accepting: true,
             shutdown: false,
@@ -2104,6 +2564,10 @@ mod tests {
             contexts,
             staged: VecDeque::new(),
             cancel_queue: VecDeque::new(),
+            owned_contexts: HashMap::new(),
+            owned_cancel_contexts: HashMap::new(),
+            owned_pending: VecDeque::new(),
+            owned_cancel_queue: VecDeque::new(),
             submissions: Vec::new(),
             accepting: true,
             shutdown: false,

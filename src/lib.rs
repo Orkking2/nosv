@@ -19,8 +19,14 @@ mod util;
 pub mod affinity;
 pub mod error;
 #[cfg(feature = "io-uring")]
+pub mod fs;
+#[cfg(feature = "io-uring")]
+pub mod io;
+#[cfg(feature = "io-uring")]
 pub mod io_uring;
 pub mod memory;
+#[cfg(feature = "io-uring")]
+pub mod net;
 pub mod runtime;
 pub mod task;
 #[cfg(feature = "time")]
@@ -65,6 +71,14 @@ mod trait_tests {
 
     assert_not_impl_any!(Runtime: Send, Sync);
     assert_impl_all!(Handle: Send, Sync, Clone);
+    #[cfg(feature = "io-uring")]
+    assert_impl_all!(io::IoHandle: Send, Sync, Clone);
+    #[cfg(feature = "io-uring")]
+    assert_impl_all!(fs::File: Send, Sync, Unpin);
+    #[cfg(feature = "io-uring")]
+    assert_impl_all!(net::TcpStream: Send, Sync, Unpin);
+    #[cfg(feature = "io-uring")]
+    assert_impl_all!(net::TcpListener: Send, Sync, Unpin);
     assert_impl_all!(JoinHandle<u32>: Send, Sync);
     assert_impl_all!(AbortHandle: Send, Sync, Clone);
 }

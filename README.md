@@ -16,7 +16,9 @@ The implemented v0.1 foundation includes:
 - one non-parallel nOS-V timer task per runtime, providing `sleep`,
   `sleep_until`, and `timeout`;
 - an optional runtime-wide `io_uring` driver with asynchronous SQ admission,
-  pointer-context `user_data`, typed CQE delivery, and explicit cancellation draining.
+  pointer-context `user_data`, typed CQE delivery, and explicit cancellation draining;
+- safe `io`, `fs`, and numeric-address `net` layers with owned buffers, positional
+  file I/O, TCP connect/accept/send/receive, and optional Tokio I/O traits.
 
 ## Example
 
@@ -83,17 +85,20 @@ wakers instead.
 
 ## Feature and release scope
 
-Default features are `rt` and `time`. Enabling `io-uring` creates one ring and
+Default features are `rt`, `time`, and `io-uring`. The I/O feature creates one ring and
 non-parallel nOS-V driver task for every runtime. `nosv::io_uring::IoUringConfig`
 controls queue depth, CQ reap size, polling target, and per-submission buffering.
 `Runtime<S, C>` selects the fork's sealed small or large entry markers, and
 `IoUringHandle::submit_entries` provides an unsafe raw-SQE iterator API. The
 runtime replaces each SQE's `user_data` with a stable context pointer and
-restores the caller value on typed CQEs. Safe `fs`, `net`, `io`, and owned-buffer
-operations remain future layers.
+restores the caller value on typed CQEs. `IoHandle`, `fs::File`, `net::TcpStream`,
+and `net::TcpListener` provide the safe, non-generic layer across every supported
+entry width. Owned-buffer operations retain resources through terminal completion;
+drop requests cancellation, although a kernel side effect may still win that race.
+Enable `tokio-compat` for Tokio `AsyncRead` and `AsyncWrite` on TCP streams.
 `futures-io` and `native-sync` continue to reserve later ecosystem layers.
 
-The initial platform baseline is Linux, `std`, Rust 1.85+, and nOS-V 4.1+.
+The initial platform baseline is Linux, `std`, Rust 1.92+, and nOS-V 4.1+.
 The crate is GPL-3.0-only to match the current `nosv-sys` package.
 
 ## Verification
