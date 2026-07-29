@@ -6,6 +6,7 @@ use crate::{
     ffi::{self, RawTask},
     runtime::{Handle, Lifecycle, RuntimeCore, enter_current, weak_handle},
     topology::{CpuId, NumaNodeId},
+    util::lock,
 };
 use std::{
     any::Any,
@@ -15,7 +16,7 @@ use std::{
     pin::Pin,
     ptr,
     rc::Rc,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     task::{Context, Poll, Wake, Waker},
 };
 
@@ -117,7 +118,7 @@ impl TaskCore {
     /// User panics are caught at poll boundaries, so poisoning is not expected normally. Recovery
     /// still lets cleanup reach a deterministic invariant check rather than unwinding through C.
     fn lock(&self) -> MutexGuard<'_, NativeGate> {
-        self.native.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.native)
     }
 
     /// Coalesces a Rust wake into one ordinary nOS-V submission for this poll epoch.
@@ -341,7 +342,7 @@ impl<T> JoinState<T> {
     }
     /// Locks the join cell, recovering its state after mutex poisoning.
     fn lock(&self) -> MutexGuard<'_, JoinInner<T>> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.inner)
     }
     /// Stores the unique terminal result without publishing it yet.
     ///
@@ -403,7 +404,7 @@ where
     /// Non-parallel native tasks prevent concurrent polling. The mutex additionally makes
     /// ownership explicit to Rust and supports callback cleanup paths.
     fn lock_future(&self) -> MutexGuard<'_, Option<Pin<Box<F>>>> {
-        self.future.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.future)
     }
 
     /// Removes and destroys the future while containing a destructor panic.

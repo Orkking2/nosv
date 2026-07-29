@@ -10,17 +10,19 @@ readme = "README.md"
 [dependencies]
 libc = "0.2"
 nosv-sys = { path = "../nosv-sys" }
+uring = { package = "io-uring", git = "https://github.com/Orkking2/io-uring.git", rev = "928e28ae35fe16d652a6cc52de71add50297a32e", optional = true }
 
 [features]
-default = ["rt", "time"]
+default = ["rt", "time", "io-uring"]
 rt = []
 time = ["rt"]
-io-uring = ["rt"]
+io-uring = ["rt", "dep:uring"]
 futures-io = ["io-uring"]
 native-sync = []
 
 [dev-dependencies]
 static_assertions = "1"
+loom = "0.7"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

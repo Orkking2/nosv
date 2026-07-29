@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  NOSV_PREFIX: ${{ github.workspace }}/nosv-prefix
+  PKG_CONFIG_PATH: ${{ github.workspace }}/nosv-prefix/lib/pkgconfig
+  LD_LIBRARY_PATH: ${{ github.workspace }}/nosv-prefix/lib
+  RUSTFLAGS: -C link-arg=-Wl,-rpath,${{ github.workspace }}/nosv-prefix/lib
+  CARGO_TERM_COLOR: always
+
+jobs:
+  required:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nosv
+      - uses: actions/checkout@v4
+        with:
+          repository: Orkking2/nosv-sys
+          ref: 963abea9da61039f03cf312823eb040a067ea77c
+          path: nosv-sys
+      - uses: actions/checkout@v4
+        with:
+          repository: bsc-pm/nos-v
+          ref: 4ecf4252107763f58405c58b2161d1dbe5e67fb9
+          path: nos-v
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool pkg-config libnuma-dev clang libclang-dev
+      - name: Build pinned nOS-V
+        working-directory: nos-v
+        run: |
+          autoreconf -fiv
+          ./configure --prefix="$NOSV_PREFIX"
+          make -j2
+          make install
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Formatting
+        working-directory: nosv
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: nosv
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Rustdoc
+        working-directory: nosv
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --all-features --no-deps
+      - name: Feature matrix
+        working-directory: nosv
+        run: |
+          cargo check --all-targets --no-default-features
+          cargo check --all-targets --no-default-features --features rt
+          cargo check --all-targets --no-default-features --features time
+          cargo check --all-targets --no-default-features --features io-uring
+          cargo check --all-targets --no-default-features --features futures-io
+          cargo check --all-targets --no-default-features --features native-sync
+          cargo check --all-targets
+          cargo check --all-targets --all-features
+      - name: Deterministic and native tests
+        working-directory: nosv
+        run: timeout 180s cargo test --all-features -- --test-threads=1
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Rust 1.85 MSRV
+        working-directory: nosv
+        run: |
+          cargo check --locked --all-targets --no-default-features
+          cargo check --locked --all-targets --all-features
+
+  scheduled-stress:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nosv
+      - uses: actions/checkout@v4
+        with:
+          repository: Orkking2/nosv-sys
+          ref: 963abea9da61039f03cf312823eb040a067ea77c
+          path: nosv-sys
+      - uses: actions/checkout@v4
+        with:
+          repository: bsc-pm/nos-v
+          ref: 4ecf4252107763f58405c58b2161d1dbe5e67fb9
+          path: nos-v
+      - run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool pkg-config libnuma-dev clang libclang-dev
+      - name: Build pinned nOS-V
+        working-directory: nos-v
+        run: |
+          autoreconf -fiv
+          ./configure --prefix="$NOSV_PREFIX" --enable-debug
+          make -j2
+          make install
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Repeat cancellation, wake, and shutdown races
+        working-directory: nosv
+        run: |
+          for run in $(seq 1 20); do
+            echo "stress iteration $run"
+            timeout 180s cargo test --all-features -- --test-threads=1
+          done
+
+  scheduled-sanitizers:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, ubsan]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nosv
+      - uses: actions/checkout@v4
+        with:
+          repository: Orkking2/nosv-sys
+          ref: 963abea9da61039f03cf312823eb040a067ea77c
+          path: nosv-sys
+      - uses: actions/checkout@v4
+        with:
+          repository: bsc-pm/nos-v
+          ref: 4ecf4252107763f58405c58b2161d1dbe5e67fb9
+          path: nos-v
+      - run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool pkg-config libnuma-dev clang libclang-dev
+      - name: Build selected sanitizer with pinned nOS-V
+        working-directory: nos-v
+        run: |
+          autoreconf -fiv
+          ./configure --prefix="$NOSV_PREFIX" --enable-debug --enable-${{ matrix.sanitizer }}
+          make -j2
+          make install
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Repeat races under ASan and UBSan
+        working-directory: nosv
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          for run in $(seq 1 5); do
+            echo "sanitizer iteration $run"
+            timeout 180s cargo test --all-features -- --test-threads=1
+          done

@@ -11,6 +11,7 @@ use crate::{
     memory::MemoryStats,
     task::{self, JoinHandle, TaskBuilder, TaskCore, TaskId},
     topology::Topology,
+    util::lock,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -21,7 +22,7 @@ use std::{
     pin::pin,
     rc::Rc,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
+        Arc, Condvar, Mutex, MutexGuard, Weak,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
     task::{Context, Poll, Wake, Waker},
@@ -96,7 +97,7 @@ impl RuntimeCore {
     /// diagnostic artifact rather than evidence that the native pointer is safe
     /// to abandon. Recovering preserves the ability to cancel and drain tasks.
     pub(crate) fn lock_state(&self) -> MutexGuard<'_, RuntimeState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     /// Reports whether the caller is in the process that created this core.
@@ -156,19 +157,100 @@ impl RuntimeCore {
 /// configuration is process-global and is consumed by native initialization. The
 /// current builder is zero-sized but provides a stable place for future Rust-only
 /// driver and instrumentation options.
-#[derive(Clone, Debug, Default)]
-pub struct RuntimeBuilder {
-    /// Prevents external struct literals while the builder has no options.
+#[cfg(feature = "io-uring")]
+#[doc(hidden)]
+pub type DefaultSubmissionEntry = crate::io_uring::raw::squeue::Entry;
+#[cfg(not(feature = "io-uring"))]
+#[doc(hidden)]
+pub type DefaultSubmissionEntry = ();
+#[cfg(feature = "io-uring")]
+#[doc(hidden)]
+pub type DefaultCompletionEntry = crate::io_uring::raw::cqueue::Entry;
+#[cfg(not(feature = "io-uring"))]
+#[doc(hidden)]
+pub type DefaultCompletionEntry = ();
+
+#[cfg(feature = "io-uring")]
+#[doc(hidden)]
+pub trait RuntimeSubmissionEntry:
+    crate::io_uring::raw::squeue::EntryMarker + Send + 'static
+{
+}
+#[cfg(feature = "io-uring")]
+impl<T: crate::io_uring::raw::squeue::EntryMarker + Send + 'static> RuntimeSubmissionEntry for T {}
+#[cfg(not(feature = "io-uring"))]
+#[doc(hidden)]
+pub trait RuntimeSubmissionEntry: Send + 'static {}
+#[cfg(not(feature = "io-uring"))]
+impl<T: Send + 'static> RuntimeSubmissionEntry for T {}
+
+#[cfg(feature = "io-uring")]
+#[doc(hidden)]
+pub trait RuntimeCompletionEntry:
+    crate::io_uring::raw::cqueue::EntryMarker + Send + 'static
+{
+}
+#[cfg(feature = "io-uring")]
+impl<T: crate::io_uring::raw::cqueue::EntryMarker + Send + 'static> RuntimeCompletionEntry for T {}
+#[cfg(not(feature = "io-uring"))]
+#[doc(hidden)]
+pub trait RuntimeCompletionEntry: Send + 'static {}
+#[cfg(not(feature = "io-uring"))]
+impl<T: Send + 'static> RuntimeCompletionEntry for T {}
+
+/// Configures Rust-layer runtime facilities without native side effects.
+pub struct RuntimeBuilder<S = DefaultSubmissionEntry, C = DefaultCompletionEntry> {
+    #[cfg(feature = "io-uring")]
+    /// Configuration prepared before native runtime initialization.
+    io_uring_config: crate::io_uring::IoUringConfig,
+    /// Selects the SQE and CQE marker implementations when I/O is enabled.
+    _io_entries: PhantomData<fn() -> (S, C)>,
+    /// Prevents external struct literals.
     _private: (),
 }
 
-impl RuntimeBuilder {
-    /// Constructs a builder with safe Rust-layer defaults.
-    ///
-    /// This function performs no FFI and may be called in any context; validation
-    /// that construction is outside a nOS-v task happens in [`Self::build`].
+impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> Default for RuntimeBuilder<S, C> {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "io-uring")]
+            io_uring_config: crate::io_uring::IoUringConfig::default(),
+            _io_entries: PhantomData,
+            _private: (),
+        }
+    }
+}
+impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> Clone for RuntimeBuilder<S, C> {
+    fn clone(&self) -> Self {
+        Self {
+            #[cfg(feature = "io-uring")]
+            io_uring_config: self.io_uring_config,
+            _io_entries: PhantomData,
+            _private: (),
+        }
+    }
+}
+impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> std::fmt::Debug
+    for RuntimeBuilder<S, C>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeBuilder").finish_non_exhaustive()
+    }
+}
+
+impl RuntimeBuilder<DefaultSubmissionEntry, DefaultCompletionEntry> {
+    /// Constructs a builder using the default ring entry widths.
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> RuntimeBuilder<S, C> {
+    /// Selects the runtime-wide `io_uring` driver configuration.
+    #[cfg(feature = "io-uring")]
+    #[must_use]
+    pub const fn io_uring_config(mut self, config: crate::io_uring::IoUringConfig) -> Self {
+        self.io_uring_config = config;
+        self
     }
 
     /// Initializes nOS-V, creates runtime task types, and publishes a runtime.
@@ -181,11 +263,13 @@ impl RuntimeBuilder {
     /// # Errors
     ///
     /// Returns [`InitError::AlreadyInTask`] from any current nOS-V task context,
-    /// or [`InitError::Native`] when initialization or resource construction fails.
-    pub fn build(&self) -> Result<Runtime, InitError> {
+    /// or a structured configuration, kernel ring, or native resource error.
+    pub fn build(&self) -> Result<Runtime<S, C>, InitError> {
         if ffi::current().is_some() {
             return Err(InitError::AlreadyInTask);
         }
+        #[cfg(feature = "io-uring")]
+        let prepared_io_uring = crate::io_uring::PreparedRing::<S, C>::new(self.io_uring_config)?;
         ffi::init()?;
 
         let task_type = match ffi::type_init(
@@ -201,6 +285,32 @@ impl RuntimeBuilder {
             }
         };
 
+        #[cfg(feature = "io-uring")]
+        let io_uring_type = match ffi::type_init(
+            Some(crate::io_uring::run_callback::<S, C>),
+            Some(crate::io_uring::completed_callback::<S, C>),
+            None,
+            c"rust.io_uring",
+        ) {
+            Ok(io_uring_type) => io_uring_type,
+            Err(error) => {
+                let _ = ffi::type_destroy(task_type);
+                let _ = ffi::shutdown();
+                return Err(InitError::Native(error));
+            }
+        };
+        #[cfg(feature = "io-uring")]
+        let io_uring = match crate::io_uring::IoUringDriver::start(io_uring_type, prepared_io_uring)
+        {
+            Ok(driver) => driver,
+            Err(error) => {
+                let _ = ffi::type_destroy(io_uring_type);
+                let _ = ffi::type_destroy(task_type);
+                let _ = ffi::shutdown();
+                return Err(InitError::Native(error));
+            }
+        };
+
         #[cfg(feature = "time")]
         let timer_type = match ffi::type_init(
             Some(crate::time::run_callback),
@@ -210,6 +320,11 @@ impl RuntimeBuilder {
         ) {
             Ok(timer_type) => timer_type,
             Err(error) => {
+                #[cfg(feature = "io-uring")]
+                {
+                    io_uring.shutdown_and_wait();
+                    let _ = ffi::type_destroy(io_uring_type);
+                }
                 let _ = ffi::type_destroy(task_type);
                 let _ = ffi::shutdown();
                 return Err(InitError::Native(error));
@@ -220,6 +335,11 @@ impl RuntimeBuilder {
             Ok(timer) => timer,
             Err(error) => {
                 let _ = ffi::type_destroy(timer_type);
+                #[cfg(feature = "io-uring")]
+                {
+                    io_uring.shutdown_and_wait();
+                    let _ = ffi::type_destroy(io_uring_type);
+                }
                 let _ = ffi::type_destroy(task_type);
                 let _ = ffi::shutdown();
                 return Err(InitError::Native(error));
@@ -245,7 +365,12 @@ impl RuntimeBuilder {
         });
         Ok(Runtime {
             core,
+            #[cfg(feature = "io-uring")]
+            io_uring_type,
+            #[cfg(feature = "io-uring")]
+            io_uring,
             active: true,
+            _entry_types: PhantomData,
             _not_send_or_sync: PhantomData,
         })
     }
@@ -257,30 +382,40 @@ impl RuntimeBuilder {
 /// pthread to balance its own init/shutdown calls. Use [`Runtime::handle`] to move
 /// spawning capability to other threads. Dropping the runtime performs the same
 /// cooperative, potentially unbounded drain as [`Runtime::shutdown`].
-pub struct Runtime {
+pub struct Runtime<S = DefaultSubmissionEntry, C = DefaultCompletionEntry>
+where
+    S: RuntimeSubmissionEntry,
+    C: RuntimeCompletionEntry,
+{
     /// Shared state used by handles, tasks, callbacks, and drivers.
     pub(crate) core: Arc<RuntimeCore>,
+    #[cfg(feature = "io-uring")]
+    /// Native descriptor type owned alongside the typed ring.
+    io_uring_type: RawTaskType,
+    #[cfg(feature = "io-uring")]
+    /// Typed runtime-wide ring and driver.
+    io_uring: Arc<crate::io_uring::IoUringDriver<S, C>>,
     /// Whether this value still owes the native runtime a shutdown operation.
     active: bool,
+    /// Keeps entry type selection present when the I/O feature is disabled.
+    _entry_types: PhantomData<fn() -> (S, C)>,
     /// `Rc` marker that statically pins lifecycle ownership to one pthread.
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
-impl Runtime {
-    /// Initializes a runtime with default Rust-layer facilities.
-    ///
-    /// This is shorthand for `Runtime::builder().build()` and has the same
-    /// owner-thread, task-context, configuration, and rollback behavior.
+impl Runtime<DefaultSubmissionEntry, DefaultCompletionEntry> {
+    /// Initializes a runtime with default ring entry widths.
     pub fn new() -> Result<Self, InitError> {
         RuntimeBuilder::new().build()
     }
-    /// Returns a builder without performing native initialization.
-    ///
-    /// Keeping builder creation side-effect free lets callers assemble future
-    /// Rust-only driver options before nOS-V reads process-global configuration.
-    pub fn builder() -> RuntimeBuilder {
+
+    /// Returns a builder using the default ring entry widths.
+    pub fn builder() -> RuntimeBuilder<DefaultSubmissionEntry, DefaultCompletionEntry> {
         RuntimeBuilder::new()
     }
+}
+
+impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> Runtime<S, C> {
     /// Clones a thread-safe spawning and query handle.
     ///
     /// The handle may cross threads, but every operation checks the runtime
@@ -290,6 +425,12 @@ impl Runtime {
         Handle {
             core: self.core.clone(),
         }
+    }
+
+    /// Clones the thread-safe capability for this runtime's typed ring.
+    #[cfg(feature = "io-uring")]
+    pub fn io_uring_handle(&self) -> crate::io_uring::IoUringHandle<S, C> {
+        crate::io_uring::IoUringHandle::new(self.io_uring.clone(), &self.core)
     }
 
     /// Drives a possibly borrowed, non-`Send` root future on the owner pthread.
@@ -442,6 +583,12 @@ impl Runtime {
         }
         drop(state);
 
+        #[cfg(feature = "io-uring")]
+        {
+            self.io_uring.shutdown_and_wait();
+            ffi::type_destroy(self.io_uring_type).map_err(ShutdownError::Native)?;
+        }
+
         #[cfg(feature = "time")]
         {
             self.core.timer.shutdown_and_wait();
@@ -454,7 +601,7 @@ impl Runtime {
     }
 }
 
-impl Drop for Runtime {
+impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> Drop for Runtime<S, C> {
     /// Attempts the same cooperative shutdown when explicit shutdown was omitted.
     ///
     /// `Drop` cannot report an error, so it logs a teardown failure. It never moves
@@ -596,7 +743,7 @@ struct ParkerGate {
 impl Parker {
     /// Locks parker state and recovers it after a caught panic.
     fn lock(&self) -> MutexGuard<'_, ParkerGate> {
-        self.gate.lock().unwrap_or_else(|p| p.into_inner())
+        lock(&self.gate)
     }
     /// Opens a new poll epoch so its first wake may submit exactly once.
     fn begin_poll(&self) {

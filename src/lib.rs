@@ -14,11 +14,12 @@
 #![warn(clippy::missing_docs_in_private_items)]
 
 mod ffi;
+mod util;
 
 pub mod affinity;
 pub mod error;
 #[cfg(feature = "io-uring")]
-pub mod io;
+pub mod io_uring;
 pub mod memory;
 pub mod runtime;
 pub mod task;

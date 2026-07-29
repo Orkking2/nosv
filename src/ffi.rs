@@ -224,7 +224,7 @@ pub(crate) fn submit(task: RawTask) -> Result<(), NativeError> {
 /// Deadline wake is distinct from ordinary submit: nOS-V records an early wake
 /// if it arrives just before the driver arms its timeout, preventing the new
 /// earlier timer from being lost.
-#[cfg(feature = "time")]
+#[cfg(any(feature = "time", feature = "io-uring"))]
 pub(crate) fn submit_deadline_wake(task: RawTask) -> Result<(), NativeError> {
     submit_with(task, nosv_sys::NOSV_SUBMIT_DEADLINE_WAKE)
 }
@@ -290,12 +290,33 @@ pub(crate) fn pause() -> Result<(), NativeError> {
     NativeError::from_code(unsafe { nosv_sys::nosv_pause(nosv_sys::NOSV_PAUSE_NONE) })
 }
 
+/// Cooperatively yields the current non-parallel driver task.
+#[cfg(feature = "io-uring")]
+pub(crate) fn yield_now() -> Result<(), NativeError> {
+    // SAFETY: only the dedicated non-parallel I/O driver calls this wrapper.
+    NativeError::from_code(unsafe { nosv_sys::nosv_yield(nosv_sys::NOSV_YIELD_NONE) }).map(drop)
+}
+
+/// Configures batching for submissions issued by wakers on the current driver task.
+#[cfg(feature = "io-uring")]
+pub(crate) fn set_submit_window_size(size: usize) -> Result<(), NativeError> {
+    // SAFETY: the caller is the running I/O driver and size was validated nonzero.
+    NativeError::from_code(unsafe { nosv_sys::nosv_set_submit_window_size(size) })
+}
+
+/// Publishes every task submission accumulated in the current submit window.
+#[cfg(feature = "io-uring")]
+pub(crate) fn flush_submit_window() -> Result<(), NativeError> {
+    // SAFETY: the caller is the running I/O driver task.
+    NativeError::from_code(unsafe { nosv_sys::nosv_flush_submit_window() })
+}
+
 /// Yields the timer driver's native task until a relative duration elapses.
 ///
 /// Nanoseconds saturate at `u64::MAX` to match the C ABI. The driver may be
 /// resumed earlier through [`submit_deadline_wake`], which is why this wrapper
 /// intentionally uses `nosv_waitfor` instead of timeout-suspend mode.
-#[cfg(feature = "time")]
+#[cfg(any(feature = "time", feature = "io-uring"))]
 pub(crate) fn waitfor(duration: std::time::Duration) -> Result<(), NativeError> {
     let nanos = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
     // SAFETY: caller is a non-parallel nOS-V task. Null is accepted for the
@@ -335,7 +356,7 @@ pub(crate) fn current_cpu() -> Result<i32, NativeError> {
 pub(crate) fn current_numa_node() -> Result<i32, NativeError> {
     // SAFETY: CurrentTask ensures a nOS-v task context.
     let value = unsafe { nosv_sys::nosv_get_current_system_numa_node() };
-    
+
     if value < 0 {
         Err(NativeError::InvalidOperation)
     } else {

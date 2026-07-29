@@ -271,3 +271,29 @@ fn free(pointer: *mut i32) {
         unsafe { libc::free(pointer.cast()) };
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::missing_docs_in_private_items)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifiers_reject_signed_abi_overflow_and_negative_domains() {
+        assert_eq!(CpuId::new(i32::MAX as u32).unwrap().get(), i32::MAX as u32);
+        assert_eq!(
+            CpuId::new(i32::MAX as u32 + 1),
+            Err(NativeError::InvalidParameter)
+        );
+        assert_eq!(
+            NumaNodeId::from_native(-1),
+            Err(NativeError::InvalidParameter)
+        );
+        assert_eq!(
+            DomainId::new(TopologyLevel::Cpu, -1),
+            Err(NativeError::InvalidParameter)
+        );
+        let domain = DomainId::new(TopologyLevel::Numa, 7).unwrap();
+        assert_eq!(domain.level(), TopologyLevel::Numa);
+        assert_eq!(domain.system_id(), 7);
+    }
+}

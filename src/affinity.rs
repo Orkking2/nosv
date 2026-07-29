@@ -133,3 +133,21 @@ impl Affinity {
         Ok(raw)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::missing_docs_in_private_items)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn affinity_index_boundary_is_checked_without_truncation() {
+        let maximum = CpuId::new(MAX_INDEX).unwrap();
+        assert!(Affinity::strict_cpu(maximum).to_raw().is_ok());
+        let too_large = CpuId::new(MAX_INDEX + 1).unwrap();
+        assert!(matches!(
+            Affinity::preferred_cpu(too_large).to_raw(),
+            Err(NativeError::InvalidParameter)
+        ));
+        assert!(Affinity::Any.to_raw().is_ok());
+    }
+}

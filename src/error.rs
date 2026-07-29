@@ -110,6 +110,12 @@ impl Error for NativeError {}
 pub enum InitError {
     /// Runtime construction was attempted from inside a nOS-V task.
     AlreadyInTask,
+    #[cfg(feature = "io-uring")]
+    /// The io_uring driver configuration is invalid.
+    InvalidIoUringConfig(crate::io_uring::InvalidIoUringConfig),
+    #[cfg(feature = "io-uring")]
+    /// The kernel rejected io_uring setup or capability probing.
+    IoUring(std::io::Error),
     /// nOS-V rejected initialization.
     Native(NativeError),
 }
@@ -122,6 +128,12 @@ impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyInTask => f.write_str("cannot create a runtime inside a nOS-v task"),
+            #[cfg(feature = "io-uring")]
+            Self::InvalidIoUringConfig(error) => {
+                write!(f, "invalid io_uring configuration: {error}")
+            }
+            #[cfg(feature = "io-uring")]
+            Self::IoUring(error) => write!(f, "io_uring initialization failed: {error}"),
             Self::Native(error) => write!(f, "runtime initialization failed: {error}"),
         }
     }
@@ -134,6 +146,10 @@ impl Error for InitError {
     /// no lower-level source.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            #[cfg(feature = "io-uring")]
+            Self::InvalidIoUringConfig(error) => Some(error),
+            #[cfg(feature = "io-uring")]
+            Self::IoUring(error) => Some(error),
             Self::Native(error) => Some(error),
             _ => None,
         }
@@ -358,3 +374,55 @@ impl fmt::Display for JoinError {
 }
 
 impl Error for JoinError {}
+
+#[cfg(test)]
+#[allow(clippy::missing_docs_in_private_items)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_known_native_code_round_trips() {
+        let cases = [
+            (
+                nosv_sys::NOSV_ERR_INVALID_CALLBACK,
+                NativeError::InvalidCallback,
+            ),
+            (
+                nosv_sys::NOSV_ERR_INVALID_METADATA_SIZE,
+                NativeError::InvalidMetadataSize,
+            ),
+            (
+                nosv_sys::NOSV_ERR_INVALID_OPERATION,
+                NativeError::InvalidOperation,
+            ),
+            (
+                nosv_sys::NOSV_ERR_INVALID_PARAMETER,
+                NativeError::InvalidParameter,
+            ),
+            (
+                nosv_sys::NOSV_ERR_NOT_INITIALIZED,
+                NativeError::NotInitialized,
+            ),
+            (nosv_sys::NOSV_ERR_OUT_OF_MEMORY, NativeError::OutOfMemory),
+            (nosv_sys::NOSV_ERR_OUTSIDE_TASK, NativeError::OutsideTask),
+            (nosv_sys::NOSV_ERR_BUSY, NativeError::Busy),
+            (nosv_sys::NOSV_ERR_TIMEOUT, NativeError::Timeout),
+        ];
+        assert_eq!(NativeError::from_code(nosv_sys::NOSV_SUCCESS), Ok(()));
+        for (code, expected) in cases {
+            assert_eq!(NativeError::from_code(code), Err(expected));
+            assert_eq!(expected.code(), code);
+            assert!(expected.to_string().contains(&code.to_string()));
+        }
+    }
+
+    #[test]
+    fn unknown_native_code_is_preserved() {
+        let code = -123_456;
+        assert_eq!(
+            NativeError::from_code(code),
+            Err(NativeError::Unknown(code))
+        );
+        assert_eq!(NativeError::Unknown(code).code(), code);
+    }
+}

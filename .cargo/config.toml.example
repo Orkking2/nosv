@@ -3,3 +3,4 @@ PKG_CONFIG_PATH = { value = "../nos-v/.nosv-prefix/lib/pkgconfig", relative = tr
 
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-arg=-Wl,-rpath,../nos-v/.nosv-prefix/lib"]
+rustdocflags = ["-C", "link-arg=-Wl,-rpath,../nos-v/.nosv-prefix/lib"]

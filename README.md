@@ -14,7 +14,9 @@ The implemented v0.1 foundation includes:
 - `yield_now`, current-runtime TLS, and scoped current CPU/NUMA queries;
 - checked topology, affinity, and shared-memory wrappers;
 - one non-parallel nOS-V timer task per runtime, providing `sleep`,
-  `sleep_until`, and `timeout`.
+  `sleep_until`, and `timeout`;
+- an optional runtime-wide `io_uring` driver with asynchronous SQ admission,
+  pointer-context `user_data`, typed CQE delivery, and explicit cancellation draining.
 
 ## Example
 
@@ -81,25 +83,28 @@ wakers instead.
 
 ## Feature and release scope
 
-Default features are `rt` and `time`. `io-uring`, `futures-io`, and
-`native-sync` reserve the later ecosystem layers. `io-uring` currently exposes
-the validated `IoUringConfig` contract and tests its private generation-token
-encoding, but deliberately submits no kernel operations yet. Those operations
-require a separate ownership/cancellation audit so kernel-visible buffers and
-tokens cannot outlive one another.
+Default features are `rt` and `time`. Enabling `io-uring` creates one ring and
+non-parallel nOS-V driver task for every runtime. `nosv::io_uring::IoUringConfig`
+controls queue depth, CQ reap size, polling target, and per-submission buffering.
+`Runtime<S, C>` selects the fork's sealed small or large entry markers, and
+`IoUringHandle::submit_entries` provides an unsafe raw-SQE iterator API. The
+runtime replaces each SQE's `user_data` with a stable context pointer and
+restores the caller value on typed CQEs. Safe `fs`, `net`, `io`, and owned-buffer
+operations remain future layers.
+`futures-io` and `native-sync` continue to reserve later ecosystem layers.
 
 The initial platform baseline is Linux, `std`, Rust 1.85+, and nOS-V 4.1+.
 The crate is GPL-3.0-only to match the current `nosv-sys` package.
 
 ## Verification
 
-The integration test runs lifecycle-sensitive behavior in a real nOS-V
-process: init/reinit, topology and memory queries, borrowed `block_on`,
+The deterministic and integration suites are documented in [`TESTING.md`](TESTING.md).
+The integration tests run lifecycle-sensitive behavior in a real nOS-V process: init/reinit, topology and memory queries, borrowed `block_on`,
 cross-thread spawn, ten thousand self-wakes, panic capture, abort, deadline
 interruption, equal-deadline timers, timeout, timer cancellation, and shutdown.
 
 ```text
 PKG_CONFIG_PATH=/path/to/prefix/lib/pkgconfig \
 LD_LIBRARY_PATH=/path/to/prefix/lib \
-cargo test --all-features
+cargo test --all-features -- --test-threads=1
 ```

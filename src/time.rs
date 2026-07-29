@@ -1,6 +1,6 @@
 //! Cancellation-safe monotonic timers driven by one nOS-V task per runtime.
 
-use crate::{ffi, runtime::Handle};
+use crate::{ffi, runtime::Handle, util::lock};
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
@@ -182,12 +182,12 @@ impl TimerDriver {
 
     /// Locks the timer heap, recovering state if an internal mutex was poisoned.
     fn lock_data(&self) -> MutexGuard<'_, DriverData> {
-        self.data.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.data)
     }
 
     /// Locks the native park gate, recovering state if an internal mutex was poisoned.
     fn lock_gate(&self) -> MutexGuard<'_, DriverGate> {
-        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.gate)
     }
 
     /// Adds a timer entry and wakes the driver so it can reconsider its next deadline.
@@ -203,7 +203,7 @@ impl TimerDriver {
         {
             let mut data = self.lock_data();
             if data.shutdown {
-                let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut state = lock(&state);
                 state.cancelled = true;
                 state.waiter = None;
                 return;
@@ -263,7 +263,7 @@ impl TimerDriver {
                 let mut data = self.lock_data();
                 if data.shutdown {
                     for entry in data.timers.drain() {
-                        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut state = lock(&entry.state);
                         state.cancelled = true;
                         state.waiter = None;
                     }
@@ -277,7 +277,7 @@ impl TimerDriver {
                         .is_some_and(|entry| entry.deadline <= now)
                     {
                         let entry = data.timers.pop().expect("peeked timer");
-                        let mut state = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut state = lock(&entry.state);
                         if !state.cancelled {
                             state.fired = true;
                             if let Some(waiter) = state.waiter.take() {
@@ -496,11 +496,11 @@ impl Future for Sleep {
     /// reactor-bound timer APIs: construction is context-free, but waiting requires a driver.
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut state = lock(&self.state);
 
             if state.fired || Instant::now() >= self.deadline {
                 state.fired = true;
-                return Poll::Ready(Self::Output::default());
+                return Poll::Ready(());
             }
 
             if state
@@ -535,7 +535,7 @@ impl Drop for Sleep {
     /// alive until the driver observes `cancelled`.
     fn drop(&mut self) {
         {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut state = lock(&self.state);
 
             state.cancelled = true;
             state.waiter = None;
@@ -550,7 +550,7 @@ impl Drop for Sleep {
 /// Creates a future that sleeps for at least `duration` on the monotonic clock.
 ///
 /// Excessively large durations that cannot be added to the current [`Instant`] are clamped to an
-/// intentionally distant fallback deadline instead of panicking, see [`far_future`].
+/// intentionally distant fallback deadline instead of panicking.
 pub fn sleep(duration: Duration) -> Sleep {
     sleep_until(
         Instant::now()
@@ -616,7 +616,7 @@ impl<F: Future> Future for Timeout<F> {
         if let Poll::Ready(output) = this.future.as_mut().poll(context) {
             return Poll::Ready(Ok(output));
         }
-        
+
         if Pin::new(&mut this.sleep).poll(context).is_ready() {
             Poll::Ready(Err(Elapsed))
         } else {
@@ -633,5 +633,37 @@ pub fn timeout<F: Future>(duration: Duration, future: F) -> Timeout<F> {
     Timeout {
         future: Box::pin(future),
         sleep: sleep(duration),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::missing_docs_in_private_items)]
+mod tests {
+    use super::*;
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Wake, Waker},
+    };
+
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[test]
+    fn expired_sleep_is_ready_without_a_runtime() {
+        let mut sleep = Box::pin(sleep(Duration::ZERO));
+        let waker = Waker::from(Arc::new(Noop));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(sleep.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[test]
+    fn ready_operation_wins_a_simultaneous_timeout() {
+        let mut timeout = Box::pin(timeout(Duration::ZERO, std::future::ready(42)));
+        let waker = Waker::from(Arc::new(Noop));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(timeout.as_mut().poll(&mut context), Poll::Ready(Ok(42)));
     }
 }
