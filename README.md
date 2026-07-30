@@ -18,9 +18,11 @@ The implemented v0.1 foundation includes:
 - an optional runtime-wide `io_uring` driver with asynchronous SQ admission,
   pointer-context `user_data`, typed CQE delivery, and explicit cancellation draining;
 - safe `io`, `fs`, and numeric-address `net` layers with owned buffers, positional
-  file I/O, TCP connect/accept/send/receive, and optional Tokio I/O traits.
+  file I/O, TCP connect/accept/send/receive, and optional Tokio I/O traits;
+- a runnable framed-TCP proof of concept with concurrent loopback clients,
+  bounded frames, operation deadlines, and cooperative failure cleanup.
 
-## Example
+## Task example
 
 ```rust
 use nosv::{Runtime, task};
@@ -44,6 +46,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.shutdown()?;
     Ok(())
 }
+```
+
+## Network and I/O proof of concept
+
+[`examples/net_io_poc.rs`](examples/net_io_poc.rs) is a self-contained example
+of the safe `net` and `io` layers. It binds a numeric loopback address, launches
+four clients, and gives each accepted connection its own nOS-V task. Messages use
+a four-byte big-endian length prefix and owned `Vec<u8>` buffers; the server
+uppercases each payload and every client verifies its response.
+
+The example deliberately passes an `IoHandle` to `TcpListener::bind_on` and
+`TcpStream::connect_on`, caps frames at 64 KiB before allocating, applies a
+five-second deadline to each network operation, and aborts and drains outstanding
+tasks on failure. It uses the default `time` and `io-uring` features and needs no
+Tokio compatibility layer or additional dependency.
+
+```text
+cargo run --example net_io_poc
+```
+
+Its framing checks can be run without initializing a native runtime:
+
+```text
+cargo test --example net_io_poc
 ```
 
 ## Build and loader setup
@@ -113,3 +139,7 @@ PKG_CONFIG_PATH=/path/to/prefix/lib/pkgconfig \
 LD_LIBRARY_PATH=/path/to/prefix/lib \
 cargo test --all-features -- --test-threads=1
 ```
+
+For a shorter end-to-end check of runtime tasks plus safe TCP and owned-buffer
+I/O, run `timeout 30s cargo run --example net_io_poc` with the same build and
+loader environment.

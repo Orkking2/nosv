@@ -28,6 +28,10 @@ native-sync = []
 static_assertions = "1"
 loom = "0.7"
 
+[[example]]
+name = "net_io_poc"
+required-features = ["io-uring", "time"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
