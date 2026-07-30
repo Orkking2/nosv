@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "nosv"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -226,6 +226,8 @@ dependencies = [
 [[package]]
 name = "nosv-sys"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "163ec10abaeb03c906290b682d0f5ea27133874741e30d325e00b151152e19dd"
 dependencies = [
  "bindgen",
  "pkg-config",

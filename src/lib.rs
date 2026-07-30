@@ -1,5 +1,11 @@
 //! Safe, futures-based access to the nOS-V task runtime.
 //!
+//! This crate is experimental and has not been battle-tested in production. It
+//! is exercised by deterministic tests, integration tests against a real nOS-V
+//! runtime and kernel `io_uring`, scheduled stress and sanitizer jobs, and a
+//! concurrent TCP smoke application. That coverage supports the tested
+//! scenarios; it is not a production-readiness guarantee.
+//!
 //! The crate deliberately keeps nOS-V descriptors private. Spawned futures are
 //! `Send + 'static` because a nOS-v task may resume on another worker pthread;
 //! a root future passed to [`Runtime::block_on`] may borrow local state and need

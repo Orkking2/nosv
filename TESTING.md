@@ -3,10 +3,17 @@
 The suite is split between deterministic state tests and lifecycle-sensitive tests that execute a
 real nOS-V runtime and kernel `io_uring` instance.
 
+This gives the crate meaningful automated exercise beyond a prototype, including concurrency and
+cancellation paths, but it is not a production qualification program. Coverage is currently scoped
+to the Linux/nOS-V baseline described in `README.md`; it does not establish behavior for every
+kernel, nOS-V configuration, workload, failure mode, or deployment environment.
+
 ## Required local gates
 
-Run these from the `nosv` checkout with `nosv-sys` and nOS-V in sibling directories. Set
-`PKG_CONFIG_PATH` and the loader path as described in `README.md`.
+Run these from the `nosv` checkout with nOS-V installed and discoverable through `pkg-config`.
+The example `.cargo/config.toml` assumes a sibling nOS-V source checkout installed under
+`../nos-v/.nosv-prefix`; otherwise set `PKG_CONFIG_PATH` and the loader path as described in
+`README.md`.
 
 ```sh
 cargo fmt --check
@@ -31,8 +38,10 @@ silently skipped.
 ## Coverage map
 
 Pure deterministic tests cover native error translation, topology and affinity bounds, timer poll
-ordering, every ring configuration field, stable pointer-context metadata, and driver park
-decisions. Clippy, rustdoc, feature-matrix, and MSRV jobs compile the public generic API.
+ordering, every ring configuration field, stable pointer-context metadata, driver park decisions,
+cancellation-CQE ordering, multishot retirement, completion overflow, and a Loom model of the
+detach/completion race. Clippy, rustdoc, feature-matrix, and MSRV jobs compile the public generic
+API.
 
 Real native tests cover fork rejection, initialization/reinitialization, borrowed roots, spawned
 and cross-thread tasks, wake storms, stale wakers, panic and abort, and timer behavior. The I/O
@@ -43,9 +52,10 @@ frame-boundary tests and a live, self-verifying run with four concurrent loopbac
 buffers, numeric TCP, per-operation deadlines, and explicit task draining. Wall-clock time is used
 only as an outer deadlock guard.
 
-GitHub Actions pins both native dependencies and uses `ubuntu-24.04`. Pull requests run the full
-required matrix and Rust 1.92 checks. A scheduled sanitized build repeats cancellation, wake, and
-shutdown races under nOS-V ASan/UBSan instrumentation.
+GitHub Actions pins its native test inputs and uses `ubuntu-24.04`. Pull requests run the full
+required matrix and Rust 1.92 checks. Scheduled jobs repeat the all-feature test suite 20 times
+against a debug nOS-V build and five times each under nOS-V ASan and UBSan instrumentation,
+concentrating additional exercise on cancellation, wake, and shutdown races.
 
 ## Safe I/O layers
 

@@ -1,6 +1,6 @@
 [package]
 name = "nosv"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.92"
 license = "GPL-3.0-only"
@@ -9,8 +9,8 @@ readme = "README.md"
 
 [dependencies]
 libc = "0.2"
-nosv-sys = { path = "../nosv-sys" }
-uring = { package = "io-uring", git = "https://github.com/Orkking2/io-uring.git", rev = "928e28ae35fe16d652a6cc52de71add50297a32e", optional = true }
+nosv-sys = "0.1.0"
+uring = { package = "io-uring", git = "https://github.com/Orkking2/io-uring.git", rev = "928e28ae35fe16d652a6cc52de71add50297a32e", version = "0.7.13", optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
 tokio = { version = "1", default-features = false, features = ["io-util"], optional = true }
 ubq = { version = "5", optional = true }

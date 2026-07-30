@@ -4,7 +4,16 @@
 nOS-V. It supports ordinary `async fn` syntax without exposing native task
 descriptors to safe code.
 
-The implemented v0.1 foundation includes:
+This crate remains experimental and has not been battle-tested in production.
+It is nevertheless beyond an initial runtime prototype: the executor, timers,
+`io_uring` driver, and owned-buffer file and TCP layers have automated coverage,
+including focused cancellation and shutdown cases, through deterministic tests,
+tests against a real nOS-V runtime and kernel ring, scheduled stress and
+sanitizer jobs, and a self-verifying concurrent TCP example. That is evidence
+for the scenarios described in [Verification](#verification) and
+[`TESTING.md`](TESTING.md), not a production-readiness guarantee.
+
+The current implementation includes:
 
 - owner-thread-checked runtime initialization and cooperative shutdown;
 - `Send + 'static` future spawning from any thread;
@@ -124,15 +133,18 @@ drop requests cancellation, although a kernel side effect may still win that rac
 Enable `tokio-compat` for Tokio `AsyncRead` and `AsyncWrite` on TCP streams.
 `futures-io` and `native-sync` continue to reserve later ecosystem layers.
 
-The initial platform baseline is Linux, `std`, Rust 1.92+, and nOS-V 4.1+.
+The current platform baseline is Linux, `std`, Rust 1.92+, and nOS-V 4.1+.
 The crate is GPL-3.0-only to match the current `nosv-sys` package.
 
 ## Verification
 
-The deterministic and integration suites are documented in [`TESTING.md`](TESTING.md).
-The integration tests run lifecycle-sensitive behavior in a real nOS-V process: init/reinit, topology and memory queries, borrowed `block_on`,
-cross-thread spawn, ten thousand self-wakes, panic capture, abort, deadline
-interruption, equal-deadline timers, timeout, timer cancellation, and shutdown.
+The deterministic and native integration suites are documented in
+[`TESTING.md`](TESTING.md). The tests exercise runtime init/reinit, topology and
+memory queries, borrowed `block_on`, cross-thread spawn, wake storms and stale
+wakers, panic capture, abort, timer ordering and cancellation, raw `io_uring`
+admission and cancellation draining, owned-buffer file I/O, numeric TCP
+fallback and loopback traffic, optional Tokio I/O traits, and shutdown. The
+native cases use a real nOS-V process and kernel ring rather than a mock.
 
 ```text
 PKG_CONFIG_PATH=/path/to/prefix/lib/pkgconfig \

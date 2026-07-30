@@ -88,7 +88,7 @@ impl Drop for DropFlag {
     }
 }
 
-/// Exercises the complete public v0.1 lifecycle against a real nOS-V installation.
+/// Exercises the current public runtime lifecycle against a real nOS-V installation.
 ///
 /// The scenario covers fork guards, topology and memory queries, a borrowed root future, task
 /// attributes, self/foreign/stale wakes, detached outputs, panic capture, cooperative abort, timer
