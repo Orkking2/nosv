@@ -72,8 +72,8 @@ jobs:
       - name: Deterministic and native tests
         working-directory: nosv
         run: timeout 180s cargo test --all-features -- --test-threads=1
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - name: Rust 1.85 MSRV
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Rust 1.92 MSRV
         working-directory: nosv
         run: |
           cargo check --locked --all-targets --no-default-features
