@@ -11,7 +11,7 @@ kernel, nOS-V configuration, workload, failure mode, or deployment environment.
 ## Required local gates
 
 Run these from the `nosv` checkout with nOS-V installed and discoverable through `pkg-config`.
-The example `.cargo/config.toml` assumes a sibling nOS-V source checkout installed under
+The example `.cargo/config.toml.example` assumes a sibling nOS-V source checkout installed under
 `../nos-v/.nosv-prefix`; otherwise set `PKG_CONFIG_PATH` and the loader path as described in
 `README.md`.
 
