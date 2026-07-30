@@ -1,4 +1,18 @@
-//! Numeric-address TCP sockets backed by completion-native `io_uring` operations.
+//! Numeric-address TCP sockets backed by completion-native `io_uring`.
+//!
+//! [`TcpStream::connect`] uses `IORING_OP_CONNECT`; owned-buffer send and receive
+//! methods use `IORING_OP_SEND` and `IORING_OP_RECV`. [`TcpListener::accept`] waits
+//! with `IORING_OP_POLL_ADD` and performs the final `accept4(2)` as a nonblocking
+//! syscall with `CLOEXEC` and nonblocking flags set atomically. Socket creation,
+//! binding, listening, options, and address queries are short synchronous syscalls.
+//!
+//! Only numeric address forms implementing this module's sealed [`ToSocketAddrs`]
+//! trait are accepted; no hostname resolution runs on nOS-V workers. Buffer-taking
+//! methods return their owned buffer on every outcome and retain it through terminal
+//! kernel completion after caller cancellation. With `tokio-compat`, [`TcpStream`]
+//! also implements Tokio's borrowed [`crate::io::AsyncRead`] and
+//! [`crate::io::AsyncWrite`] using independent readiness lanes. A borrowed operation
+//! that returns `Pending` has not modified or consumed its caller's buffer.
 
 use crate::io::{self, BufResult, IoBuf, IoBufMut, IoHandle, OpWork, OwnedOp};
 #[cfg(feature = "tokio-compat")]
@@ -13,11 +27,16 @@ use std::{
 };
 use uring::{opcode, squeue, types};
 
-/// Conversion to one or more numeric socket addresses.
+/// Converts a supported numeric address form into ordered connection candidates.
 ///
-/// Hostname resolution is intentionally not performed on runtime workers.
+/// Implementations are provided for [`SocketAddr`], `(IpAddr, u16)`,
+/// `(Ipv4Addr, u16)`, `(Ipv6Addr, u16)`, socket-address arrays and slices, and
+/// references to those forms. The trait is sealed so hostname-bearing forms cannot
+/// introduce blocking DNS resolution on runtime workers. Constructors try returned
+/// addresses sequentially and report the last failure. An empty array or slice is
+/// rejected with [`ErrorKind::InvalidInput`].
 pub trait ToSocketAddrs: sealed::Sealed {
-    /// Copies the numeric candidates in fallback order.
+    /// Copies numeric candidates in the order they should be attempted.
     fn to_socket_addrs(&self) -> Vec<SocketAddr>;
 }
 
@@ -78,6 +97,12 @@ impl<T: ToSocketAddrs + ?Sized> ToSocketAddrs for &T {
 }
 
 /// A connected, nonblocking TCP stream bound to one I/O runtime.
+///
+/// The type is `Send + Sync` but deliberately not [`Clone`]. In-flight operations
+/// retain the socket independently, so dropping the stream cannot invalidate a
+/// submitted kernel request. With `tokio-compat`, independent read and write
+/// readiness lanes permit full-duplex use by Tokio utilities such as `split` and
+/// `copy_bidirectional`.
 pub struct TcpStream {
     /// Socket retained by every in-flight operation.
     socket: Arc<Socket>,
@@ -93,12 +118,31 @@ pub struct TcpStream {
 
 impl TcpStream {
     /// Connects to the first successful numeric address on the current runtime.
+    ///
+    /// Candidates are attempted sequentially in [`ToSocketAddrs`] order. Each
+    /// attempt uses a new atomic `CLOEXEC`/nonblocking socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for no candidates, or an error when no
+    /// current runtime exists, `IORING_OP_CONNECT` is unsupported, the runtime
+    /// closes, socket creation fails, or every candidate fails. For multiple
+    /// candidates, the final attempt's error is returned.
     pub async fn connect(addresses: impl ToSocketAddrs) -> std::io::Result<Self> {
         let io = IoHandle::try_current().map_err(|_| io::runtime_closed_error())?;
         Self::connect_on(&io, addresses).await
     }
 
-    /// Connects to the first successful numeric address on an explicit runtime.
+    /// Connects to the first successful numeric address using `io`.
+    ///
+    /// This form does not require a current-runtime polling scope. Candidates are
+    /// attempted sequentially, each with a new atomic `CLOEXEC`/nonblocking socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for no candidates. It also reports a
+    /// closed or fork-inherited runtime, unsupported connect opcode, socket creation
+    /// failure, and connection failures; the last candidate's error is returned.
     pub async fn connect_on(io: &IoHandle, addresses: impl ToSocketAddrs) -> std::io::Result<Self> {
         let mut last = None;
         let addresses = addresses.to_socket_addrs();
@@ -119,7 +163,7 @@ impl TcpStream {
                 }
             };
             let address = SockAddr::from(address);
-            
+
             match OwnedOp::new(
                 io,
                 ConnectWork {
@@ -137,12 +181,32 @@ impl TcpStream {
         Err(last.expect("nonempty address attempt has a result"))
     }
 
-    /// Receives into an owned buffer.
+    /// Receives once into the start of the owned buffer.
+    ///
+    /// At most [`IoBufMut::bytes_total`] bytes are written. Existing initialized
+    /// bytes may be overwritten. A successful count of zero means orderly peer
+    /// shutdown, and the returned buffer marks at least the reported prefix
+    /// initialized.
+    ///
+    /// # Errors
+    ///
+    /// Validation, unsupported-opcode, runtime-closure, and socket receive errors
+    /// are returned alongside the original buffer.
     pub async fn recv<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
         self.recv_offset(buf, 0).await
     }
 
-    /// Receives until the whole writable buffer is filled or EOF is reached.
+    /// Receives until the entire writable allocation is filled.
+    ///
+    /// The target length is [`IoBufMut::bytes_total`], and multiple receives may be
+    /// issued. If a later receive fails, the returned buffer retains the prefix
+    /// initialized by earlier completions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::UnexpectedEof`] if the peer closes before the allocation
+    /// is full and [`ErrorKind::InvalidInput`] for an oversized operation. Runtime,
+    /// unsupported-opcode, and socket errors are returned with the buffer.
     pub async fn recv_exact<B: IoBufMut>(&self, mut buf: B) -> BufResult<(), B> {
         let total = buf.bytes_total();
         let mut filled = 0usize;
@@ -166,12 +230,29 @@ impl TcpStream {
         (Ok(()), buf)
     }
 
-    /// Sends initialized bytes from an owned buffer.
+    /// Sends once from the initialized prefix of an owned buffer.
+    ///
+    /// At most [`IoBuf::bytes_init`] bytes are sent, `MSG_NOSIGNAL` suppresses
+    /// `SIGPIPE`, and a successful operation may report a short count.
+    ///
+    /// # Errors
+    ///
+    /// Validation, unsupported-opcode, runtime-closure, and socket send errors are
+    /// returned alongside the original buffer.
     pub async fn send<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
         self.send_offset(buf, 0).await
     }
 
-    /// Sends every initialized byte from an owned buffer.
+    /// Sends the entire initialized prefix of an owned buffer.
+    ///
+    /// Short sends are retried and every attempt uses `MSG_NOSIGNAL`. The original
+    /// buffer is returned after success or failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::WriteZero`] if an attempt makes no progress and
+    /// [`ErrorKind::InvalidInput`] for an oversized operation. Runtime,
+    /// unsupported-opcode, and socket errors are forwarded with the buffer.
     pub async fn send_all<B: IoBuf>(&self, mut buf: B) -> BufResult<(), B> {
         let total = buf.bytes_init();
         let mut sent = 0usize;
@@ -192,32 +273,60 @@ impl TcpStream {
         (Ok(()), buf)
     }
 
-    /// Returns the local socket address.
+    /// Returns the local IP address and port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system address-query error or [`ErrorKind::InvalidData`]
+    /// if the descriptor unexpectedly reports a non-IP address.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         socket_addr(self.socket.local_addr()?)
     }
 
-    /// Returns the connected peer address.
+    /// Returns the connected peer's IP address and port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system address-query error or [`ErrorKind::InvalidData`]
+    /// if the descriptor unexpectedly reports a non-IP address.
     pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
         socket_addr(self.socket.peer_addr()?)
     }
 
-    /// Returns and clears a pending socket error.
+    /// Returns and clears the pending `SO_ERROR`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be queried.
     pub fn take_error(&self) -> std::io::Result<Option<Error>> {
         self.socket.take_error()
     }
 
-    /// Returns whether Nagle's algorithm is disabled.
+    /// Returns whether `TCP_NODELAY` disables Nagle's algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be queried.
     pub fn nodelay(&self) -> std::io::Result<bool> {
         self.socket.tcp_nodelay()
     }
 
-    /// Enables or disables TCP_NODELAY.
+    /// Enables or disables `TCP_NODELAY`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed.
     pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
         self.socket.set_tcp_nodelay(nodelay)
     }
 
-    /// Shuts down the read half, write half, or both halves.
+    /// Disables further receives, sends, or both according to `how`.
+    ///
+    /// This calls the nonblocking `shutdown(2)` syscall immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system shutdown error.
     pub fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
         self.socket.shutdown(how)
     }
@@ -306,6 +415,10 @@ impl AsRawFd for TcpStream {
 }
 
 /// A nonblocking TCP listener bound to one I/O runtime.
+///
+/// Listener creation performs only numeric-address socket setup; it never resolves
+/// hostnames. The type is `Send + Sync` and retains its descriptor for pending
+/// readiness operations.
 pub struct TcpListener {
     /// Listening descriptor retained by accept polls.
     socket: Arc<Socket>,
@@ -314,13 +427,33 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    /// Binds and listens on the first successful numeric address on the current runtime.
+    /// Binds and listens on the first successful address on the current runtime.
+    ///
+    /// Socket creation, `bind(2)`, and `listen(2)` are short synchronous setup calls
+    /// performed when the future is first polled. Candidates are tried sequentially
+    /// with a backlog of 1024.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for no candidates, or an error when no
+    /// current runtime exists, socket setup fails for every candidate, or the runtime
+    /// is already closed. The final candidate's error is returned.
     pub async fn bind(addresses: impl ToSocketAddrs) -> std::io::Result<Self> {
         let io = IoHandle::try_current().map_err(|_| io::runtime_closed_error())?;
         Self::bind_on(&io, addresses).await
     }
 
-    /// Binds and listens on the first successful numeric address on an explicit runtime.
+    /// Binds and listens on the first successful address using `io`.
+    ///
+    /// This form does not require a current-runtime polling scope. Socket creation,
+    /// `bind(2)`, and `listen(2)` are short synchronous setup calls; candidates are
+    /// tried sequentially with a backlog of 1024.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for no candidates. It also reports a
+    /// closed or fork-inherited runtime and socket setup failures, returning the
+    /// final candidate's error when all attempts fail.
     pub async fn bind_on(io: &IoHandle, addresses: impl ToSocketAddrs) -> std::io::Result<Self> {
         io.ensure_running()
             .map_err(|_| io::runtime_closed_error())?;
@@ -346,7 +479,18 @@ impl TcpListener {
         Err(last.expect("nonempty address attempt has a result"))
     }
 
-    /// Waits for readiness, then accepts one nonblocking connection.
+    /// Accepts one connection and returns its numeric peer address.
+    ///
+    /// The method first attempts nonblocking `accept4(2)`. If no connection is
+    /// ready, it waits with a one-shot `IORING_OP_POLL_ADD` and retries. Accepted
+    /// descriptors receive `CLOEXEC` and nonblocking status atomically. Dropping a
+    /// pending future cancels only its readiness request; no borrowed state is
+    /// retained and no later final accept syscall is performed by that future.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when poll-add is unsupported, the runtime closes, readiness
+    /// polling fails, `accept4(2)` fails, or the peer address is not an IP address.
     pub async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
         loop {
             match accept_socket(&self.socket) {
@@ -371,12 +515,23 @@ impl TcpListener {
         }
     }
 
-    /// Returns the bound local address.
+    /// Returns the listener's bound IP address and port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system address-query error or [`ErrorKind::InvalidData`]
+    /// for an unexpected non-IP address.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         socket_addr(self.socket.local_addr()?)
     }
 
-    /// Returns and clears a pending socket error.
+    /// Returns and clears the listener's pending asynchronous socket error.
+    ///
+    /// A return value of `Ok(None)` means that no error is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be queried.
     pub fn take_error(&self) -> std::io::Result<Option<Error>> {
         self.socket.take_error()
     }
@@ -653,6 +808,9 @@ impl ReadyLane {
 }
 
 #[cfg(feature = "tokio-compat")]
+/// Performs borrowed reads only after an immediate nonblocking receive succeeds or
+/// the independent read readiness lane completes. `Pending` leaves `ReadBuf`
+/// untouched.
 impl tokio::io::AsyncRead for TcpStream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -698,6 +856,9 @@ impl tokio::io::AsyncRead for TcpStream {
 }
 
 #[cfg(feature = "tokio-compat")]
+/// Performs borrowed writes with `MSG_NOSIGNAL` and an independent write readiness
+/// lane. Flush is immediate because the stream has no userspace output buffer;
+/// shutdown closes the write half.
 impl tokio::io::AsyncWrite for TcpStream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,

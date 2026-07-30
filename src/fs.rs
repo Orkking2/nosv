@@ -1,4 +1,17 @@
-//! Completion-native file I/O with owned buffers.
+//! Completion-native positional file I/O with owned buffers.
+//!
+//! [`File`] values are bound to the [`IoHandle`] used to open them. Read and write
+//! methods take ownership of their buffers and return those buffers on every
+//! operational outcome. Reads write from the start of an [`IoBufMut`] allocation
+//! up to [`IoBufMut::bytes_total`]; writes consume the initialized prefix reported
+//! by [`IoBuf::bytes_init`]. All ordinary file I/O is positioned and does not use
+//! or advance a shared file cursor.
+//!
+//! Constructors without an `_on` suffix use [`IoHandle::try_current`]. Their `_on`
+//! counterparts accept an explicit handle and may be constructed outside a runtime
+//! polling scope. Dropping an in-flight future requests cancellation, while its
+//! buffer, path, and descriptor remain retained through the terminal kernel
+//! completion. A kernel side effect may still win cancellation.
 
 use crate::io::{self, BufResult, IoBuf, IoBufMut, IoHandle, OpWork, OwnedOp};
 use std::{
@@ -14,64 +27,139 @@ use std::{
 };
 use uring::{opcode, squeue, types};
 
-/// An asynchronously opened file bound to one runtime's I/O driver.
+/// An owned file descriptor bound to one runtime's I/O driver.
+///
+/// `File` is deliberately not [`Clone`]. It is `Send + Sync`, and each in-flight
+/// operation internally retains the descriptor, so dropping the `File` does not
+/// invalidate kernel work already submitted. Positioned methods do not modify a
+/// shared cursor; [`File::append`] is available only when opened in append mode.
 pub struct File {
     /// Descriptor retained by every in-flight operation.
     fd: Arc<OwnedFd>,
 
     /// Runtime driver used for subsequent operations.
     io: IoHandle,
-    
+
     /// Whether the descriptor was opened with `O_APPEND`.
     append: bool,
 }
 
 impl File {
-    /// Opens an existing file for reading on the current runtime.
+    /// Opens an existing file for read-only access on the current runtime.
+    ///
+    /// This is equivalent to enabling [`OpenOptions::read`] and calling
+    /// [`OpenOptions::open`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no current I/O runtime exists, the path contains an
+    /// interior NUL byte, `IORING_OP_OPENAT` is unsupported, the runtime closes,
+    /// or the operating system rejects the open.
     pub async fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let io = IoHandle::try_current().map_err(|_| io::runtime_closed_error())?;
         Self::open_on(&io, path).await
     }
 
-    /// Opens an existing file for reading on an explicit runtime.
+    /// Opens an existing file for read-only access on `io`.
+    ///
+    /// This form does not require a current-runtime polling scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid path, an unsupported open opcode, a closed
+    /// or fork-inherited runtime, or an operating-system open failure.
     pub async fn open_on(io: &IoHandle, path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true);
         options.open_on(io, path).await
     }
 
-    /// Creates or truncates a file for writing on the current runtime.
+    /// Opens a file for write-only access, creating or truncating it.
+    ///
+    /// Creation uses mode `0o666` subject to the process umask.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no current I/O runtime exists, the path is invalid,
+    /// the open opcode is unsupported, the runtime closes, or the operating system
+    /// rejects creation or truncation.
     pub async fn create(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let io = IoHandle::try_current().map_err(|_| io::runtime_closed_error())?;
         Self::create_on(&io, path).await
     }
 
-    /// Creates or truncates a file for writing on an explicit runtime.
+    /// Opens a file on `io` for write-only access, creating or truncating it.
+    ///
+    /// Creation uses mode `0o666` subject to the process umask. This form does not
+    /// require a current-runtime polling scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid path, an unsupported open opcode, a closed
+    /// or fork-inherited runtime, or an operating-system open failure.
     pub async fn create_on(io: &IoHandle, path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         options.open_on(io, path).await
     }
 
-    /// Creates a new file for writing on the current runtime.
+    /// Creates a new write-only file and fails if the path already exists.
+    ///
+    /// Creation uses mode `0o666` subject to the process umask.
+    ///
+    /// # Errors
+    ///
+    /// In addition to runtime, path, capability, and operating-system failures,
+    /// returns [`ErrorKind::AlreadyExists`] when the target already exists.
     pub async fn create_new(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let io = IoHandle::try_current().map_err(|_| io::runtime_closed_error())?;
         Self::create_new_on(&io, path).await
     }
 
-    /// Creates a new file for writing on an explicit runtime.
+    /// Creates a new write-only file on `io` and fails if it already exists.
+    ///
+    /// Creation uses mode `0o666` subject to the process umask. This form does not
+    /// require a current-runtime polling scope.
+    ///
+    /// # Errors
+    ///
+    /// In addition to closed-runtime, path, opcode, and operating-system failures,
+    /// returns [`ErrorKind::AlreadyExists`] when the target already exists.
     pub async fn create_new_on(io: &IoHandle, path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         options.open_on(io, path).await
     }
 
-    /// Reads at `offset`, returning both the result and buffer.
+    /// Reads from the absolute file `offset` into the start of `buf`.
+    ///
+    /// At most [`IoBufMut::bytes_total`] bytes are read. Existing initialized bytes
+    /// may be overwritten. On success, the returned count may be smaller than the
+    /// writable size, including zero at end of file, and the returned buffer marks
+    /// at least that prefix initialized. The operation does not change a file
+    /// cursor.
+    ///
+    /// # Errors
+    ///
+    /// The result half reports validation, unsupported-opcode, runtime-closure, and
+    /// kernel read errors. The buffer is returned unchanged on an error reported by
+    /// this single operation.
     pub async fn read_at<B: IoBufMut>(&self, buf: B, offset: u64) -> BufResult<usize, B> {
         self.read_at_offset(buf, offset, 0).await
     }
 
-    /// Reads until the whole writable buffer is filled or EOF is reached.
+    /// Reads from `offset` until the entire writable allocation is filled.
+    ///
+    /// The target length is [`IoBufMut::bytes_total`], not the buffer's initialized
+    /// length. Multiple positioned reads may be issued. If a later read fails, the
+    /// returned buffer retains bytes initialized by earlier successful reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::UnexpectedEof`] if EOF occurs before the allocation is
+    /// full and [`ErrorKind::InvalidInput`] if the offset range overflows or the
+    /// buffer exceeds one SQE's length limit. Runtime, opcode, and kernel errors are
+    /// forwarded in the result half; the buffer is always returned.
     pub async fn read_exact_at<B: IoBufMut>(&self, mut buf: B, offset: u64) -> BufResult<(), B> {
         let total = buf.bytes_total();
         let mut filled = 0usize;
@@ -101,7 +189,16 @@ impl File {
         (Ok(()), buf)
     }
 
-    /// Writes initialized bytes at `offset`, returning both result and buffer.
+    /// Writes initialized bytes from `buf` at the absolute file `offset`.
+    ///
+    /// One operation writes at most [`IoBuf::bytes_init`] bytes and may complete
+    /// with a short count. It does not change a file cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] without submission for an append-mode
+    /// file or an oversized buffer. Other validation, unsupported-opcode, runtime,
+    /// and kernel errors are returned alongside the original buffer.
     pub async fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> BufResult<usize, B> {
         if self.append {
             return (
@@ -115,7 +212,16 @@ impl File {
         self.write_at_offset(buf, offset, 0).await
     }
 
-    /// Writes all initialized bytes at `offset`.
+    /// Writes the entire initialized prefix of `buf` starting at `offset`.
+    ///
+    /// Short writes are retried with increasing absolute offsets. The method does
+    /// not change a file cursor and always returns the original buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for append-mode files, offset overflow,
+    /// or an oversized operation, and [`ErrorKind::WriteZero`] if a write makes no
+    /// progress. Runtime, unsupported-opcode, and kernel errors are forwarded.
     pub async fn write_all_at<B: IoBuf>(&self, mut buf: B, offset: u64) -> BufResult<(), B> {
         if self.append {
             return (
@@ -151,7 +257,17 @@ impl File {
         (Ok(()), buf)
     }
 
-    /// Appends initialized bytes using this append-mode descriptor.
+    /// Performs one append-mode write from the initialized prefix of `buf`.
+    ///
+    /// The descriptor must have been opened with [`OpenOptions::append`]. The
+    /// kernel chooses the end-of-file position atomically according to `O_APPEND`;
+    /// this method may return a short count and does not retry it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] if the file is not in append mode or the
+    /// buffer is too large for one SQE. Runtime, unsupported-opcode, and kernel
+    /// write errors are returned together with the original buffer.
     pub async fn append<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
         if !self.append {
             return (
@@ -165,7 +281,14 @@ impl File {
         self.write_at_offset(buf, u64::MAX, 0).await
     }
 
-    /// Flushes file data and metadata to durable storage.
+    /// Requests synchronization of file data and associated metadata.
+    ///
+    /// This is the completion-native equivalent of `fsync(2)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IORING_OP_FSYNC` is unsupported, the runtime is closed,
+    /// or the operating system cannot synchronize the file.
     pub async fn sync_all(&self) -> std::io::Result<()> {
         OwnedOp::new(
             &self.io,
@@ -177,7 +300,15 @@ impl File {
         .await
     }
 
-    /// Flushes file data, without requiring unrelated metadata, to storage.
+    /// Requests synchronization of file data and metadata needed to retrieve it.
+    ///
+    /// This uses the `IORING_FSYNC_DATASYNC` flag and may omit metadata unrelated
+    /// to subsequent data retrieval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IORING_OP_FSYNC` is unsupported, the runtime is closed,
+    /// or the operating system cannot synchronize the file.
     pub async fn sync_data(&self) -> std::io::Result<()> {
         OwnedOp::new(
             &self.io,
@@ -271,7 +402,12 @@ impl AsRawFd for File {
     }
 }
 
-/// Builder for standard file access, creation, and Unix flags.
+/// Configures file access, creation behavior, Unix mode, and custom flags.
+///
+/// The builder follows the standard-library [`std::fs::OpenOptions`] model and
+/// implements [`OpenOptionsExt`]. At least one of read, write, or append must be
+/// enabled before opening. `O_CLOEXEC` is always applied and cannot be disabled by
+/// custom flags.
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     /// Whether reads are permitted.
@@ -293,7 +429,11 @@ pub struct OpenOptions {
 }
 
 impl OpenOptions {
-    /// Creates an empty option set.
+    /// Creates an option set with no access mode enabled.
+    ///
+    /// Creation mode defaults to `0o666`; all access and creation flags default to
+    /// false. Calling [`OpenOptions::open`] before enabling read, write, or append
+    /// returns [`ErrorKind::InvalidInput`].
     pub fn new() -> Self {
         Self {
             read: false,
@@ -308,48 +448,79 @@ impl OpenOptions {
     }
 
     /// Enables or disables read access.
+    ///
+    /// Read combined with write or append produces read-write access.
     pub fn read(&mut self, read: bool) -> &mut Self {
         self.read = read;
         self
     }
 
-    /// Enables or disables write access.
+    /// Enables or disables ordinary write access.
+    ///
+    /// This does not enable append semantics; use [`OpenOptions::append`] for that.
     pub fn write(&mut self, write: bool) -> &mut Self {
         self.write = write;
         self
     }
 
-    /// Enables or disables append access.
+    /// Enables or disables append access (`O_APPEND`).
+    ///
+    /// Append counts as write access. Positioned [`File::write_at`] and
+    /// [`File::write_all_at`] reject a file opened with this option; use
+    /// [`File::append`] instead.
     pub fn append(&mut self, append: bool) -> &mut Self {
         self.append = append;
         self
     }
 
-    /// Enables or disables truncation of an existing file.
+    /// Enables or disables truncation of an existing file (`O_TRUNC`).
+    ///
+    /// Truncation requires write or append access. It is ignored when
+    /// [`OpenOptions::create_new`] is enabled.
     pub fn truncate(&mut self, truncate: bool) -> &mut Self {
         self.truncate = truncate;
         self
     }
 
-    /// Enables or disables creation when the path is absent.
+    /// Enables or disables creation when the path is absent (`O_CREAT`).
+    ///
+    /// Creation requires write or append access and uses the configured Unix mode
+    /// subject to the process umask.
     pub fn create(&mut self, create: bool) -> &mut Self {
         self.create = create;
         self
     }
 
-    /// Enables exclusive creation and failure when the path exists.
+    /// Enables or disables exclusive creation (`O_CREAT | O_EXCL`).
+    ///
+    /// This option requires write or append access, fails if the target exists,
+    /// and suppresses truncation.
     pub fn create_new(&mut self, create_new: bool) -> &mut Self {
         self.create_new = create_new;
         self
     }
 
-    /// Opens using the current runtime.
+    /// Opens `path` with these options on the current runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for incompatible options or an interior
+    /// NUL byte. It also reports absence of a current runtime, runtime closure, an
+    /// unsupported open opcode, and operating-system open errors.
     pub async fn open(&self, path: impl AsRef<Path>) -> std::io::Result<File> {
         let io = IoHandle::try_current().map_err(|_| io::runtime_closed_error())?;
         self.open_on(&io, path).await
     }
 
-    /// Opens using an explicit runtime I/O capability.
+    /// Opens `path` with these options on the explicit `io` capability.
+    ///
+    /// This form does not require a current-runtime polling scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for incompatible options or an interior
+    /// NUL byte. It also reports a closed or fork-inherited runtime, an unsupported
+    /// open opcode, and operating-system open errors.
     pub async fn open_on(&self, io: &IoHandle, path: impl AsRef<Path>) -> std::io::Result<File> {
         let (flags, mode) = self.flags()?;
         let path = CString::new(path.as_ref().as_os_str().as_bytes()).map_err(|_| {
@@ -366,7 +537,7 @@ impl OpenOptions {
         })
     }
 
-    /// Validates options and constructs Linux open flags.
+    /// Validates access/creation combinations and constructs Linux open flags.
     fn flags(&self) -> std::io::Result<(i32, libc::mode_t)> {
         if !self.read && !self.write && !self.append {
             return Err(Error::new(

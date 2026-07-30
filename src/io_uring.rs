@@ -1464,15 +1464,15 @@ where
             let ring = ring_guard
                 .as_ref()
                 .unwrap_or_else(|| invariant_abort("ring missing during reap"));
-            
+
             // SAFETY: only the non-parallel driver consumes this CQ.
             let mut cq = unsafe { ring.completion_shared() };
-            
+
             cq.sync();
-            
+
             let values = cq.by_ref().take(self.config.reap_size).collect::<Vec<_>>();
             let backlog = values.len() == self.config.reap_size || !cq.is_empty();
-            
+
             (values, backlog)
         };
 
@@ -1486,7 +1486,7 @@ where
         for state in overflow {
             self.request_cancel(&state, Delivery::Overflow);
         }
-        
+
         (wakes, backlog)
     }
 

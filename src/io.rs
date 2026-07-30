@@ -1,8 +1,17 @@
-//! Completion-native owned I/O primitives.
+//! Completion-native I/O handles and owned-buffer contracts.
 //!
-//! Operations submitted through this module retain every buffer and descriptor
-//! until the kernel reports the original operation terminal. Dropping a future
-//! requests cancellation, but a kernel side effect can still win that race.
+//! The safe [`crate::fs`] and [`crate::net`] operations move their buffers, paths,
+//! addresses, and descriptor references into the runtime-wide I/O driver. Those
+//! resources remain alive until the original kernel operation reaches a terminal
+//! completion, even when the caller drops its future. Every buffer-taking method
+//! returns the buffer together with its operational result.
+//!
+//! Dropping a submitted future requests cancellation and prevents later delivery
+//! to that future. Cancellation does not roll back a kernel operation that already
+//! won the race: a file write, connection attempt, or other side effect may still
+//! occur. The optional `tokio-compat` feature uses readiness plus nonblocking
+//! syscalls for borrowed TCP I/O, so a poll that returns `Pending` performs no
+//! borrowed-buffer I/O.
 
 use crate::{RuntimeClosed, runtime::RuntimeCore, util::lock};
 use std::{
@@ -17,39 +26,64 @@ use std::{
 };
 use uring::squeue;
 
-/// A result paired with the owned buffer supplied to an operation.
+/// An operation result paired with the original owned buffer.
+///
+/// The buffer is returned on success, kernel errors, validation errors, unsupported
+/// opcodes, and runtime closure. For mutable operations, successfully initialized
+/// bytes remain reflected in the returned buffer even when a later exact/all loop
+/// fails.
 pub type BufResult<T, B> = (io::Result<T>, B);
 
-/// A stable initialized buffer that may be retained by the kernel.
+/// An owned buffer with a stable initialized byte prefix.
+///
+/// Implementations supplied by this crate cover [`Vec<u8>`], [`Box<[u8]>`],
+/// [`&'static [u8]`], and [`&'static mut [u8]`]. File and socket write
+/// operations read exactly the first [`bytes_init`](Self::bytes_init) bytes.
 ///
 /// # Safety
 ///
-/// Implementations must return the same allocation and initialized byte count
-/// while ownership is held by an I/O operation. The pointer must remain valid
-/// for reads of `bytes_init()` bytes when the value is moved.
+/// Moving the implementing value must not change the allocation address returned
+/// by [`stable_ptr`](Self::stable_ptr). That pointer must remain valid for reads of
+/// `bytes_init()` bytes, and the first `bytes_init()` bytes must remain initialized,
+/// for the entire time the operation owns the value. `bytes_init()` must not exceed
+/// the allocation and must remain consistent with the pointer.
 pub unsafe trait IoBuf: Send + 'static {
     /// Returns the stable start of the allocation.
+    ///
+    /// The pointer may be dangling for a zero-length allocation, but it must satisfy
+    /// [`IoBuf`]'s validity requirements whenever [`bytes_init`](Self::bytes_init)
+    /// is nonzero.
     fn stable_ptr(&self) -> *const u8;
 
-    /// Returns the number of initialized bytes available for writing.
+    /// Returns the initialized prefix length readable by an I/O operation.
     fn bytes_init(&self) -> usize;
 }
 
-/// A stable buffer whose allocation may be initialized by the kernel.
+/// An [`IoBuf`] whose allocation may be initialized by an I/O operation.
+///
+/// Reads and receives begin at the allocation start and may write up to
+/// [`bytes_total`](Self::bytes_total) bytes. For a [`Vec<u8>`], this is its capacity,
+/// not its current length; existing initialized bytes may be overwritten. Boxed and
+/// static mutable slices expose their entire length.
 ///
 /// # Safety
 ///
-/// In addition to [`IoBuf`]'s requirements, `stable_mut_ptr()` must permit writes
-/// of `bytes_total()` bytes. `set_init(n)` must make the first `n` bytes safe to
-/// read, and is called only after the driver validates a completion length.
+/// In addition to [`IoBuf`]'s requirements,
+/// [`stable_mut_ptr`](Self::stable_mut_ptr) must remain valid for writes of
+/// `bytes_total()` bytes while the operation owns the value. `bytes_total()` must
+/// not exceed the allocation. [`set_init`](Self::set_init) must soundly publish the
+/// initialized prefix reported by a validated kernel completion.
 pub unsafe trait IoBufMut: IoBuf {
-    /// Returns the stable mutable start of the allocation.
+    /// Returns the stable mutable start of the writable allocation.
+    ///
+    /// As with [`IoBuf::stable_ptr`], a zero-sized allocation need not point to
+    /// writable storage.
     fn stable_mut_ptr(&mut self) -> *mut u8;
 
-    /// Returns the allocation size writable by the kernel.
+    /// Returns the total number of bytes writable from `stable_mut_ptr()`.
     fn bytes_total(&self) -> usize;
 
-    /// Marks the first `n` bytes initialized.
+    /// Marks at least the first `n` allocation bytes initialized.
     ///
     /// # Safety
     ///
@@ -151,7 +185,13 @@ unsafe impl IoBufMut for &'static mut [u8] {
     }
 }
 
-/// Non-generic capability for completion-native operations on one runtime.
+/// A cloneable, non-generic capability for one runtime's owned I/O driver.
+///
+/// Unlike [`crate::io_uring::IoUringHandle`], this handle erases the runtime's SQE
+/// and CQE widths and is therefore suitable for [`crate::fs::File`] and
+/// [`crate::net`] types. Clones are `Send + Sync`; keeping a clone alive does not
+/// keep the runtime open. Operations validate the runtime generation when first
+/// polled and fail after shutdown or in a forked child.
 #[derive(Clone)]
 pub struct IoHandle {
     /// Erased driver shared by all entry-width configurations.
@@ -167,7 +207,12 @@ impl std::fmt::Debug for IoHandle {
 }
 
 impl IoHandle {
-    /// Returns the owned-I/O capability installed for the currently polled task.
+    /// Returns the owned-I/O capability for the currently polled runtime future.
+    ///
+    /// A current runtime is installed only while [`crate::Runtime::block_on`] polls
+    /// its root future or while a spawned nOS-V task callback polls its future.
+    /// Code that already has a runtime or [`crate::runtime::Handle`] should prefer
+    /// its explicit `io_handle` method.
     ///
     /// # Errors
     ///
@@ -306,7 +351,12 @@ pub(crate) trait ErasedOwnedDriver: Send + Sync {
     fn cancel(&self, control: &Arc<OwnedControl>);
 }
 
-/// Lazy, cancellation-safe, single-completion operation future.
+/// Lazy, resource-safe, single-completion operation future.
+///
+/// Resources remain local before the first poll. The first poll transfers them to
+/// the driver; after that point, progress no longer depends on repolling this
+/// future. Drop requests cancellation, while the driver retains resources through
+/// the terminal original CQE.
 pub(crate) struct OwnedOp<T> {
     /// Explicit driver/runtime capability.
     handle: IoHandle,
@@ -409,7 +459,7 @@ impl<T> Drop for OwnedOp<T> {
     }
 }
 
-/// Converts a negative CQE result into an ordinary I/O error.
+/// Converts a Linux CQE result into a byte count or its positive errno error.
 pub(crate) fn result(result: i32) -> io::Result<usize> {
     if result < 0 {
         Err(io::Error::from_raw_os_error(-result))
@@ -418,12 +468,12 @@ pub(crate) fn result(result: i32) -> io::Result<usize> {
     }
 }
 
-/// Creates the uniform error returned after runtime closure.
+/// Creates the uniform [`io::ErrorKind::BrokenPipe`] runtime-closure error.
 pub(crate) fn runtime_closed_error() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "nOS-V I/O runtime is closed")
 }
 
-/// Creates an unsupported-opcode error.
+/// Creates the uniform [`io::ErrorKind::Unsupported`] opcode-probe error.
 pub(crate) fn unsupported_opcode_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -432,4 +482,5 @@ pub(crate) fn unsupported_opcode_error() -> io::Error {
 }
 
 #[cfg(feature = "tokio-compat")]
+/// Tokio borrowed-I/O traits and read buffer used by the TCP compatibility layer.
 pub use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};

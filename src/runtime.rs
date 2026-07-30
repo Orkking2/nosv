@@ -439,6 +439,11 @@ impl<S: RuntimeSubmissionEntry, C: RuntimeCompletionEntry> Runtime<S, C> {
     }
 
     /// Clones the non-generic completion-native I/O capability.
+    ///
+    /// The returned handle can be passed to the explicit `_on` constructors in
+    /// [`crate::fs`] and [`crate::net`], including from code that is not currently
+    /// being polled by this runtime. It is `Send + Sync`, but retaining it does not
+    /// keep the runtime open; operations fail after shutdown or in a forked child.
     #[cfg(feature = "io-uring")]
     pub fn io_handle(&self) -> crate::io::IoHandle {
         crate::io::IoHandle {
@@ -691,6 +696,10 @@ impl Handle {
     }
 
     /// Returns the non-generic completion-native I/O capability.
+    ///
+    /// The returned handle can be passed to the explicit `_on` constructors in
+    /// [`crate::fs`] and [`crate::net`] without entering a current-runtime polling
+    /// scope. It is `Send + Sync`, but retaining it does not keep the runtime open.
     ///
     /// # Errors
     ///
