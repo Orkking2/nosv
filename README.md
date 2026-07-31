@@ -155,3 +155,8 @@ cargo test --all-features -- --test-threads=1
 For a shorter end-to-end check of runtime tasks plus safe TCP and owned-buffer
 I/O, run `timeout 30s cargo run --example net_io_poc` with the same build and
 loader environment.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 or later.
+See [LICENSE](LICENSE) for details.
